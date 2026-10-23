@@ -46,7 +46,7 @@ Robert: Done: reminder set for Thu 09:00.
 ## Quick start
 
 ```sh
-git clone https://github.com/<you>/robert.git
+git clone https://github.com/virtan/robert.git
 cd robert
 npm ci
 npm run setup
