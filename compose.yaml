@@ -1,0 +1,22 @@
+# First run:   docker compose run --rm robert setup     (interactive; saves secrets in the volume)
+# Then:        docker compose up -d && docker compose logs -f
+#
+# Instead of running setup you can pass secrets from your shell or from a .env file next to
+# this file (see .env.example). Values passed here take precedence over the saved ones.
+services:
+  robert:
+    build: .
+    image: robert:latest
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    volumes:
+      - robert-data:/data
+    environment:
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      ROBERT_OWNER_ID: ${ROBERT_OWNER_ID:-}
+      TZ: ${TZ:-UTC}
+
+volumes:
+  robert-data:
