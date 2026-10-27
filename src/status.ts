@@ -201,11 +201,7 @@ export async function runUpdate(opts: { yes?: boolean } = {}): Promise<boolean> 
     fail('npm ci failed. Fix the error above, then run: npm ci && npm run update');
     return false;
   }
-  if (old === now && before.length) {
-    say('No new code, so no restart needed.');
-    return true;
-  }
-
+  // Always restart: the running copy may predate a pull done by hand.
   let okAll = true;
   for (const i of before) {
     switch (i.kind) {
