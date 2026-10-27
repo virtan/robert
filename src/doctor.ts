@@ -4,6 +4,7 @@ import { loadConfig, loadEnvFile, paths, presetIds, readSecrets } from './config
 import { DB } from './db.ts';
 import { ffmpeg } from './media.ts';
 import { OpenRouter } from './openrouter.ts';
+import { redact } from './log.ts';
 import { bold, fail, ok, say, warn } from './setup/ui.ts';
 
 /** Checks the installation end to end and explains how to fix what's wrong. Returns false on errors. */
@@ -31,6 +32,8 @@ export async function runDoctor(): Promise<boolean> {
   } catch {}
 
   const s = readSecrets();
+  redact(s.botToken);
+  redact(s.openrouterKey);
   if (!s.openrouterKey) bad('OPENROUTER_API_KEY is not set (run `npm run setup`)');
   if (!s.botToken) bad('TELEGRAM_BOT_TOKEN is not set (run `npm run setup`)');
 

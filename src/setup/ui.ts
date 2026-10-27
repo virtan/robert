@@ -1,4 +1,5 @@
 import readline from 'node:readline/promises';
+import { scrub } from '../log.ts';
 
 const tty = process.stdout.isTTY;
 const paint = (code: string) => (s: string) => (tty ? `\x1b[${code}m${s}\x1b[0m` : s);
@@ -9,7 +10,8 @@ export const yellow = paint('33');
 export const red = paint('31');
 export const cyan = paint('36');
 
-export const say = (s = '') => process.stdout.write(s + '\n');
+/** Prints a line; tokens registered with log.redact() are blanked out. */
+export const say = (s = '') => process.stdout.write(scrub(s) + '\n');
 export const ok = (s: string) => say(`${green('✓')} ${s}`);
 export const warn = (s: string) => say(`${yellow('!')} ${s}`);
 export const fail = (s: string) => say(`${red('✗')} ${s}`);

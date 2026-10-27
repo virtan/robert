@@ -9,7 +9,7 @@ export function redact(secret: string | undefined): void {
   if (secret && secret.length >= 8) secrets.add(secret);
 }
 
-function scrub(text: string): string {
+export function scrub(text: string): string {
   for (const s of secrets) text = text.split(s).join('<redacted>');
   return text;
 }
