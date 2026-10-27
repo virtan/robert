@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import { Api as BotApi } from 'grammy';
-import { loadConfig, loadEnvFile, paths, readSecrets } from './config.ts';
+import { loadConfig, loadEnvFile, paths, presetIds, readSecrets } from './config.ts';
 import { DB } from './db.ts';
 import { ffmpeg } from './media.ts';
 import { OpenRouter } from './openrouter.ts';
@@ -74,7 +74,7 @@ export async function runDoctor(): Promise<boolean> {
       check('transcribe', cfg.models.transcribe, stt);
       check('tts', cfg.models.tts, speech);
       check('image', cfg.models.image, images);
-      for (const p of cfg.modelPresets) if (!chat.has(p)) warn(`/model preset ${p} isn't available any more`);
+      for (const p of presetIds(cfg)) if (!chat.has(p)) warn(`/model preset ${p} isn't available any more`);
     } catch (err) {
       warn(`Couldn't check models: ${(err as Error).message}`);
     }

@@ -26,7 +26,10 @@ const FAMILIES: RegExp[] = [
 ];
 
 /** Words that say nothing about which model is meant ("what models are available?"). */
-const GENERIC = new Set(['model', 'models', 'available', 'list', 'all', 'best', 'popular', 'top', 'show', 'which', 'llm', 'llms', 'модель', 'модели', 'доступные', 'список']);
+const GENERIC = new Set(['model', 'models', 'available', 'list', 'best', 'popular', 'top', 'show', 'which', 'llm', 'llms', 'модель', 'модели', 'доступные', 'список']);
+
+/** Words asking for more than the short list. */
+const MORE = new Set(['all', 'more', 'other', 'others', 'every', 'все', 'всё', 'еще', 'ещё', 'больше', 'другие', 'остальные']);
 
 /**
  * Routers, variants and moving aliases ("openrouter/free", "…:batch", "~…-latest") are rarely what
@@ -160,9 +163,14 @@ export class Catalog {
   }
 }
 
-/** True for queries like "available models" that name no model at all. */
+/** True for queries like "available models" or "all models" that name no model at all. */
 export function isGeneric(query: string): boolean {
-  return tokenize(query.toLowerCase()).every((w) => GENERIC.has(w));
+  return tokenize(query.toLowerCase()).every((w) => GENERIC.has(w) || MORE.has(w));
+}
+
+/** True for generic queries that ask for the longer list ("all models", "more"). */
+export function wantsMore(query: string): boolean {
+  return isGeneric(query) && tokenize(query.toLowerCase()).some((w) => MORE.has(w));
 }
 
 function tokenize(s: string): string[] {
@@ -186,17 +194,6 @@ export function shortName(m: CatalogModel): string {
   return m.name.replace(/^[^:]+:\s*/, '');
 }
 
-/** One compact line for model lists: short name, id, price and what it can take in. */
-export function modelLine(m: CatalogModel): string {
-  const price = (p?: string) => {
-    const n = Number(p) * 1e6;
-    return p ? `$${Number.isInteger(n) ? n : n.toFixed(2)}` : '?';
-  };
-  const inputs = m.architecture.input_modalities.filter((x) => x !== 'text');
-  return `${shortName(m)} — ${m.id} (${price(m.pricing.prompt)}/${price(m.pricing.completion)} per M` +
-    (inputs.length ? `; ${inputs.join(', ')}` : '') + ')';
-}
-
 /** Context budget for recent messages: the configured size, shrunk to fit small context windows. */
 export function historyBudget(m: CatalogModel | undefined, historyTokens: number): number {
   return m?.context_length ? Math.max(2000, Math.min(historyTokens, Math.floor(m.context_length * 0.5) - 2000)) : historyTokens;
@@ -216,4 +213,63 @@ export function switchNote(m: CatalogModel | undefined, historyTokens: number): 
     lines.push('⚠️ Free models and routers are rate-limited and noticeably less accurate, especially with tools.');
   }
   return lines.join('\n');
+}
+
+/** Typical tokens of one answer: what Robert sends (system prompt and history) and what comes back. */
+export interface AnswerSize {
+  prompt: number;
+  completion: number;
+}
+
+export const DEFAULT_ANSWER_SIZE: AnswerSize = { prompt: 6000, completion: 400 };
+
+/** Estimated price of one answer, in words: "free", "~20 answers per cent", "~3¢ per answer". */
+export function costLabel(m: CatalogModel, size: AnswerSize = DEFAULT_ANSWER_SIZE): string {
+  const usd = size.prompt * Number(m.pricing.prompt || 0) + size.completion * Number(m.pricing.completion || 0);
+  if (!(usd > 0)) return 'free';
+  const cents = usd * 100;
+  if (cents < 0.5) {
+    const per = 1 / cents;
+    return `~${per >= 10 ? Math.round(per / 5) * 5 : Math.round(per)} answers per cent`;
+  }
+  return `~${cents < 10 ? cents.toFixed(1).replace(/\.0$/, '') : Math.round(cents)}¢ per answer`;
+}
+
+/** Fallback strengths from what the catalog says about speed, price and inputs. */
+function traits(m: CatalogModel): string | null {
+  const out: string[] = [];
+  if (/flash|mini|haiku|lite|nano|small|fast/i.test(m.id)) out.push('fast');
+  const perAnswer = DEFAULT_ANSWER_SIZE.prompt * Number(m.pricing.prompt || 0) + DEFAULT_ANSWER_SIZE.completion * Number(m.pricing.completion || 0);
+  if (perAnswer > 0 && perAnswer < 0.002) out.push('very cheap');
+  const inputs = m.architecture.input_modalities;
+  if (inputs.includes('audio') && inputs.includes('video')) out.push('understands voice and video natively');
+  else if (inputs.includes('image')) out.push('sees images');
+  return out.length ? out.join(', ') : null;
+}
+
+/**
+ * What a model is good at, taken from its OpenRouter description ("particularly strong at …",
+ * "suited for …"). Descriptions in the catalog are cut off, so a trailing partial item is dropped.
+ */
+export function strengthOf(m: CatalogModel): string | null {
+  const d = (m.description ?? '').replace(/\s+/g, ' ');
+  const re = /(?:particularly|especially) strong at ([^.]+)|(?:is |are )?(?:well[- ])?suited (?:for|to) ([^.]+)|(?:designed|built|optimized|optimised|trained) (?:specifically )?for ([^.]+)|flagship model for ([^.]+)/i;
+  const hit = d.match(re);
+  let s = hit?.slice(1).find(Boolean)?.trim();
+  if (!s) return null;
+  if (/(\.\.\.|…)$/.test(s) || d.endsWith(s + '...') || d.endsWith(s + '…')) {
+    s = s.replace(/(\.\.\.|…)$/, '');
+    const cut = Math.max(s.lastIndexOf(', '), s.lastIndexOf(' and '));
+    if (cut > 10) s = s.slice(0, cut);
+  }
+  // Drop trailing asides: ", succeeding Grok 4.6", ", it delivers…".
+  s = s.replace(/,\s*(succeeding|replacing|it|which|while|making|with|and is|as)\b.*$/i, '');
+  s = s.replace(/,? (and|or)$/, '').replace(/,\s*$/, '');
+  return s.length > 110 ? `${s.slice(0, s.lastIndexOf(' ', 107))}…` : s;
+}
+
+/** "Claude Opus 5.5 — the hardest questions… · ~3¢ per answer · anthropic/claude-opus-5.5" */
+export function modelEntry(m: CatalogModel, opts: { note?: string; size?: AnswerSize; current?: boolean } = {}): string {
+  const note = opts.note ?? strengthOf(m) ?? traits(m);
+  return `${shortName(m)}${opts.current ? ' (current)' : ''}${note ? ` — ${note}` : ''} · ${costLabel(m, opts.size)} · ${m.id}`;
 }

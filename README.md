@@ -30,8 +30,9 @@ Robert: Done: reminder set for Thu 09:00.
 - **Remembers.** Every message is stored in a local SQLite database. Older conversation is folded
   into a rolling summary, so context stays small and cheap.
 - **Any model, switchable from Telegram.** Use `/model opus`, tap a preset, or say "Robert, switch
-  to Gemini Flash" (owner only). It detects model capabilities (vision, audio, files, tools)
-  from OpenRouter.
+  to Gemini Flash" (owner only). Ask "which models are there?" for a short list with what each
+  is best for and roughly what an answer costs. It detects model capabilities (vision, audio,
+  files, tools) from OpenRouter.
 - **Controls cost.** A daily spending cap, a per-user rate limit, and `/status` to see what you
   spent today.
 - **Easy setup.** A wizard creates the bot for you through @BotFather, turns off privacy mode, adds
@@ -102,7 +103,8 @@ Commands:
 | `/model <name>` | owner | Switch this chat's model, e.g. `/model opus`, `/model google/gemini-3.8-flash` |
 | `/model global <name>` | owner | Change the default model for all chats |
 | `/model default` | owner | Make this chat use the default model again |
-| `/models` | everyone | Well-known current models (the newest of each major family), with prices |
+| `/models` | everyone | Recommended models with what each is best for and its cost per answer |
+| `/models all` | everyone | A longer list: the newest model of each major family |
 | `/models <words>` | everyone | Search all OpenRouter models, e.g. `/models grok` |
 | `/mode smart\|direct` | owner | *smart* also answers implicit requests; *direct* only answers when addressed |
 | `/names <list>` | owner | Names and nicknames Robert answers to, e.g. `/names Robert, Rob, Роберт*, Роб` |
@@ -176,7 +178,10 @@ Environment variables take precedence over `.env`, so you can also run Robert wi
   "names": ["Robert", "Роберт*", "Bob"], // what it answers to; * also matches inflected forms
   "timezone": "Europe/Lisbon",        // for reminders and timestamps
   "models": { "chat": "openai/gpt-6.1-sol" }, // any role from the table above
-  "modelPresets": ["meta/muse-spark-open", "..."], // buttons shown by /model
+  "modelPresets": [                   // the recommended list and /model buttons
+    { "id": "meta/muse-spark-open", "bestFor": "everyday chat and research at a low price" },
+    "anthropic/claude-opus-5.5"       // a plain id works too; its strengths come from OpenRouter
+  ],
   "ttsVoice": "Kore",
   "defaultMode": "smart",             // or "direct"
   "dailyBudgetUsd": 5,                // 0 = unlimited

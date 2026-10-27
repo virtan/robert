@@ -7,7 +7,8 @@ import { log } from './log.ts';
 import {
   audioFormat, decodeText, extFromMime, isTextDocument, MAX_DOWNLOAD, removeMedia, saveMedia, toSpeechMp3, videoFrame,
 } from './media.ts';
-import { describeModel, isGeneric, modelLine, shortName, switchNote } from './models.ts';
+import { describeModel, isGeneric, modelEntry, shortName, switchNote, wantsMore } from './models.ts';
+import { presetIds, presetNote } from './config.ts';
 import { OpenRouterError } from './openrouter.ts';
 import type { Outbox } from './tools.ts';
 import { isCommandForOtherBot, isDirect, nameRegex, parseCommand, realReplyTo, type Command } from './triggers.ts';
@@ -623,7 +624,7 @@ export class Robert {
       await this.bot.api.leaveChat(target).catch(() => {});
       await ctx.editMessageText(`🚪 Left "${this.db.getChat(target)?.title ?? target}".`).catch(() => {});
     } else if (kind === 'md' && ctx.chat) {
-      const model = arg === 'default' ? null : this.cfg.modelPresets[Number(arg)];
+      const model = arg === 'default' ? null : presetIds(this.cfg)[Number(arg)];
       this.db.setChatModel(ctx.chat.id, model ?? null);
       const id = model ?? this.cfg.models.chat;
       await ctx.editMessageText(`Model for this chat: ${model ?? `default (${id})`}\n\n${switchNote(this.brain.catalog.get(id), this.cfg.historyTokens)}`)
@@ -653,7 +654,7 @@ export class Robert {
         const current = this.brain.modelFor(chat);
         if (!cmd.args) {
           const kb = new InlineKeyboard();
-          this.cfg.modelPresets.forEach((id, i) => {
+          presetIds(this.cfg).forEach((id, i) => {
             const m = this.brain.catalog.get(id);
             const label = m ? shortName(m) : id;
             kb.text(id === current ? `• ${label}` : label, `md:${i}`).row();
@@ -694,11 +695,17 @@ export class Robert {
       case 'models': {
         await this.brain.catalog.ensure();
         const current = this.brain.modelFor(chat);
+        const size = this.db.typicalAnswerSize() ?? undefined;
         const generic = isGeneric(cmd.args);
-        const list = generic ? this.brain.catalog.featured(this.cfg.modelPresets) : this.brain.catalog.resolve(cmd.args).candidates;
+        const list = !generic
+          ? this.brain.catalog.resolve(cmd.args).candidates
+          : wantsMore(cmd.args)
+            ? this.brain.catalog.featured(presetIds(this.cfg))
+            : presetIds(this.cfg).map((id) => this.brain.catalog.get(id)).filter((m) => !!m);
+        const head = generic ? (wantsMore(cmd.args) ? 'Current models:' : 'Recommended models (/models all for more, /models <words> to search):') : '';
         await reply(list.length
-          ? (generic ? 'Well-known models (search others with /models <words>):\n' : '') +
-            list.map((m) => `${m.id === current ? '▸' : '•'} ${modelLine(m)}`).join('\n')
+          ? [head, ...list.map((m) => `${m.id === current ? '▸' : '•'} ${modelEntry(m, { note: presetNote(this.cfg, m.id), size })}`),
+            '_Costs are estimates for a typical answer here._'].filter(Boolean).join('\n')
           : 'No models match.');
         break;
       }
@@ -812,7 +819,7 @@ const COMMANDS: Record<string, { owner?: boolean; menu?: string }> = {
   start: {},
   help: { menu: 'What I can do' },
   model: { menu: 'Show or change the AI model' },
-  models: { menu: 'Search available models' },
+  models: { menu: 'Recommended models, strengths and costs' },
   mode: { owner: true, menu: 'When I join the conversation' },
   names: { owner: true },
   status: { menu: 'Model, spending and memory' },
@@ -829,7 +836,7 @@ function helpText(name: string, username: string, owner: boolean): string {
     'I can search the web, read links, photos, PDFs and voice messages, search our chat history, set reminders, draw images and talk.',
     '',
     '/model — show the current AI model',
-    '/models — well-known models; /models <words> searches all',
+    '/models — recommended models with strengths and costs (/models all, /models <words>)',
     '/status — model, spending and memory',
     '/summary — what I remember from earlier',
     ...(owner

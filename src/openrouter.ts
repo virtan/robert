@@ -55,6 +55,7 @@ export interface ChatResponse {
 export interface CatalogModel {
   id: string;
   name: string;
+  description?: string;
   created: number;
   context_length: number;
   architecture: { input_modalities: string[]; output_modalities: string[] };

@@ -472,6 +472,17 @@ export class DB {
       .run(n(u.chatId), u.kind, u.model, u.cost ?? 0, n(u.promptTokens), n(u.completionTokens));
   }
 
+  /** Average tokens of recent answering calls, or null until there are enough of them. */
+  typicalAnswerSize(): { prompt: number; completion: number } | null {
+    const r = this.sql
+      .prepare(
+        `SELECT COUNT(*) AS n, AVG(prompt_tokens) AS p, AVG(completion_tokens) AS c FROM usage
+         WHERE kind = 'chat' AND ts >= unixepoch() - 14 * 86400 AND prompt_tokens IS NOT NULL`,
+      )
+      .get() as { n: number; p: number | null; c: number | null };
+    return r.n >= 10 && r.p && r.c ? { prompt: Math.round(r.p), completion: Math.round(r.c) } : null;
+  }
+
   /** USD spent since the start of the current UTC day. */
   spentToday(): number {
     const start = Math.floor(Date.now() / 86_400_000) * 86_400;

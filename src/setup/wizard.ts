@@ -1,7 +1,7 @@
 import { Api as BotApi } from 'grammy';
 import type { UserFromGetMe } from 'grammy/types';
 import { DB } from '../db.ts';
-import { IN_CONTAINER, loadConfig, loadEnvFile, paths, readSecrets, saveConfig, writeEnvFile, type Config } from '../config.ts';
+import { IN_CONTAINER, loadConfig, loadEnvFile, paths, presetIds, presetNote, readSecrets, saveConfig, writeEnvFile, type Config } from '../config.ts';
 import { ffmpeg } from '../media.ts';
 import { OpenRouter } from '../openrouter.ts';
 import { installService } from '../service.ts';
@@ -225,8 +225,9 @@ async function preferences(cfg: Config, me: UserFromGetMe): Promise<void> {
     warn(`Unknown time zone "${tz}", keeping ${cfg.timezone}.`);
   }
 
-  const presets = cfg.modelPresets;
-  const idx = await choose('Default model (you can change it from Telegram later with /model)', [...presets, 'Other (type an OpenRouter model id)'],
+  const presets = presetIds(cfg);
+  const label = (id: string) => (presetNote(cfg, id) ? `${id} ${dim(`— ${presetNote(cfg, id)}`)}` : id);
+  const idx = await choose('Default model (you can change it from Telegram later with /model)', [...presets.map(label), 'Other (type an OpenRouter model id)'],
     Math.max(0, presets.indexOf(cfg.models.chat)));
   cfg.models.chat = idx < presets.length ? presets[idx] : await askRequired('Model id (e.g. anthropic/claude-sonnet-5.5)');
 

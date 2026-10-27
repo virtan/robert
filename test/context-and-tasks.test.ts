@@ -130,6 +130,20 @@ describe('grounding', () => {
     assert.match(system, /Message ids are for your tools only/);
   });
 
+  test('asking for models gives the short list with strengths and costs', async () => {
+    h.config.modelPresets = [{ id: 'anthropic/claude-opus-5.5', bestFor: 'the hardest questions' }, h.config.models.chat];
+    h.chatReplies.push(completion(null, [{ name: 'find_models', args: { query: 'available models' } }]), (req) => {
+      const result = String(req.messages.at(-1)!.content);
+      assert.match(result, /^Recommended models/);
+      assert.match(result, /- Claude Opus 5\.5 — the hardest questions · ~\d.*¢ per answer · anthropic\/claude-opus-5\.5/);
+      assert.match(result, /\(current\)/);
+      assert.equal(result.split('\n').filter((l) => l.startsWith('- ')).length, 2);
+      return completion('Here they are.');
+    });
+    await h.send({ text: 'Robert, which models are available?' });
+    assert.equal(h.sent().at(-1)!.payload.text, 'Here they are.');
+  });
+
   test('switching models explains what happens to memory', async () => {
     await h.send({ ...command('/model opus'), from: OWNER });
     assert.match(String(h.sent().at(-1)!.payload.text), /Memory carries over/);

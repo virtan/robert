@@ -4,7 +4,8 @@ import { body, displayName, isImage, localTime } from './context.ts';
 import type { ChatRow, MessageRow } from './db.ts';
 import { log } from './log.ts';
 import { dataUrl, extFromMime, saveMedia, toVoiceOgg } from './media.ts';
-import { describeModel, isGeneric, modelLine, switchNote } from './models.ts';
+import { DEFAULT_ANSWER_SIZE, describeModel, isGeneric, modelEntry, switchNote, wantsMore } from './models.ts';
+import { presetIds, presetNote } from './config.ts';
 import { runJs } from './sandbox/run.ts';
 import type { CatalogModel, Tool } from './openrouter.ts';
 import { parseWhen } from './time.ts';
@@ -72,10 +73,11 @@ export function toolDefinitions(opts: { runCode: boolean }): Tool[] {
       'Print with console.log; the value of the last expression is returned too. Limits: 5 s, 64 MB.', {
       code: { type: 'string' },
     }, ['code'])] : []),
-    fn('find_models', 'List AI models Robert can use. Without a query, returns a short list of well-known current models: ' +
-      'show it as a compact list of the short names (e.g. "Claude Opus 5.5", "Grok 4.7"), not ids or routers. ' +
-      'With a query such as "opus" or "gemini flash", searches the whole OpenRouter catalog.', {
-      query: { type: 'string', description: 'Optional model name words. Leave empty to list well-known models.' },
+    fn('find_models', 'List AI models Robert can use, each with what it is best for and its cost per answer. Without a ' +
+      'query, returns the short list of recommended models; query "all" returns a longer list of current models; a query ' +
+      'such as "opus" or "gemini flash" searches the whole OpenRouter catalog. Show each model on its own line as ' +
+      '"Name — best for … (cost)", keeping the strengths and costs; leave out ids unless asked.', {
+      query: { type: 'string', description: 'Optional. Empty: recommended models; "all": more models; or model name words.' },
     }),
     fn('switch_model', 'Change the AI model Robert uses. Only works when the owner asked.', {
       query: { type: 'string', description: 'Model id or a loose name like "opus" or "gemini flash".' },
@@ -251,16 +253,23 @@ async function sendVoice(env: ToolEnv, a: Record<string, unknown>): Promise<stri
 }
 
 async function findModels(env: ToolEnv, a: Record<string, unknown>): Promise<string> {
-  await env.brain.catalog.ensure();
+  const { brain, chat } = env;
+  await brain.catalog.ensure();
   const query = String(a.query ?? '');
-  const current = env.brain.modelFor(env.chat);
-  const mark = (m: CatalogModel) => `${m.id === current ? '(current) ' : ''}${modelLine(m)}`;
+  const current = brain.modelFor(chat);
+  const size = brain.db.typicalAnswerSize() ?? undefined;
+  const entry = (m: CatalogModel) => `- ${modelEntry(m, { note: presetNote(brain.config, m.id), size, current: m.id === current })}`;
+  const costNote = `Costs are estimates for a typical answer here (~${Math.round((size ?? DEFAULT_ANSWER_SIZE).prompt / 1000)}k tokens in, ` +
+    `${(size ?? DEFAULT_ANSWER_SIZE).completion} out); long answers and web searches cost more.`;
   if (isGeneric(query)) {
-    return 'Well-known models (more exist; search by name):\n' + env.brain.catalog.featured(env.brain.config.modelPresets).map(mark).join('\n');
+    const list = wantsMore(query)
+      ? brain.catalog.featured(presetIds(brain.config))
+      : presetIds(brain.config).map((id) => brain.catalog.get(id)).filter((m) => !!m);
+    return `${wantsMore(query) ? 'Current models' : 'Recommended models (ask for "all models" for more)'}:\n${list.map(entry).join('\n')}\n${costNote}`;
   }
-  const { candidates } = env.brain.catalog.resolve(query);
-  if (!candidates.length) return 'No models match. Call find_models without a query for the list of well-known models.';
-  return candidates.map(mark).join('\n');
+  const { candidates } = brain.catalog.resolve(query);
+  if (!candidates.length) return 'No models match. Call find_models without a query for the recommended models.';
+  return `${candidates.map(entry).join('\n')}\n${costNote}`;
 }
 
 async function switchModel(env: ToolEnv, a: Record<string, unknown>): Promise<string> {

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { Catalog, isGeneric, modelLine } from '../src/models.ts';
+import { Catalog, costLabel, isGeneric, modelEntry, strengthOf, wantsMore } from '../src/models.ts';
 import { fakeModel } from './fixtures.ts';
 
 const catalog = new Catalog({ models: async () => [] }, null);
@@ -62,5 +62,22 @@ test('generic queries and short lines', () => {
   assert.ok(isGeneric('available models'));
   assert.ok(isGeneric('Доступные модели'));
   assert.ok(!isGeneric('opus'));
-  assert.equal(modelLine(catalog.get('x-ai/grok-4.7')!), 'Grok 4.7 — x-ai/grok-4.7 ($2/$10 per M; image)');
+  assert.ok(wantsMore('all models') && wantsMore('все модели') && !wantsMore('models'));
+});
+
+test('strengths come from the description, without asides or a cut-off tail', () => {
+  const m = (description: string) => ({ ...catalog.get('x-ai/grok-4.7')!, description });
+  assert.equal(strengthOf(m('Grok is the flagship model for coding, agentic tasks, and knowledge work, succeeding Grok 4.6. More.')), 'coding, agentic tasks, and knowledge work');
+  assert.equal(strengthOf(m('It is particularly strong at building features, fixing bugs, and producing...')), 'building features, fixing bugs');
+  assert.equal(strengthOf(m('A model from somewhere.')), null);
+  assert.equal(modelEntry(m('A model from somewhere.'), { note: 'quick answers' }), 'Grok 4.7 — quick answers · ~1.6¢ per answer · x-ai/grok-4.7');
+});
+
+test('cost per answer reads naturally', () => {
+  const priced = (p: number, c: number) => ({ ...catalog.get('x-ai/grok-4.7')!, pricing: { prompt: String(p / 1e6), completion: String(c / 1e6) } });
+  assert.equal(costLabel(priced(0, 0)), 'free');
+  assert.equal(costLabel(priced(0.14, 0.42)), '~10 answers per cent');
+  assert.equal(costLabel(priced(1.25, 4.25)), '~0.9¢ per answer');
+  assert.equal(costLabel(priced(4, 20)), '~3.2¢ per answer');
+  assert.equal(costLabel(priced(4, 20), { prompt: 20000, completion: 1000 }), '~10¢ per answer');
 });

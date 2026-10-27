@@ -37,6 +37,13 @@ export interface Models {
   image: string;
 }
 
+/** A model offered by /model and listed first when someone asks which models there are. */
+export interface ModelPreset {
+  id: string;
+  /** What it's best for, shown next to it in model lists. */
+  bestFor: string;
+}
+
 export interface Config {
   /** Telegram user id of the owner. Only the owner can change models and approve groups. */
   ownerId: number;
@@ -45,8 +52,8 @@ export interface Config {
   names: string[];
   timezone: string;
   models: Models;
-  /** Shown as buttons by /model. */
-  modelPresets: string[];
+  /** Shown as buttons by /model and as the short list of models. Plain ids work too. */
+  modelPresets: (string | ModelPreset)[];
   ttsVoice: string;
   defaultMode: Mode;
   /** Stop calling paid models for the rest of the UTC day once this is spent. 0 = unlimited. */
@@ -79,14 +86,15 @@ export const DEFAULTS: Config = {
     image: 'google/gemini-3.1-flash-image',
   },
   modelPresets: [
-    'meta/muse-spark-open',
-    'anthropic/claude-sonnet-5.5',
-    'anthropic/claude-opus-5.5',
-    'openai/gpt-6.1-sol',
-    'google/gemini-3.8-flash',
-    'deepseek/deepseek-v4.1-flash',
-    'moonshotai/kimi-k3',
+    { id: 'meta/muse-spark-open', bestFor: 'everyday chat and research at a low price; reliable with tools, and takes photos, voice and video directly' },
+    { id: 'anthropic/claude-sonnet-5.5', bestFor: 'deep technical knowledge: programming, debugging and precise explanations' },
+    { id: 'anthropic/claude-opus-5.5', bestFor: 'the hardest questions and long multi-step reasoning; slower and pricier' },
+    { id: 'openai/gpt-6.1-sol', bestFor: 'analysing long documents and professional work' },
+    { id: 'google/gemini-3.8-flash', bestFor: 'quick, inexpensive answers with solid reasoning; understands voice and video natively' },
+    { id: 'x-ai/grok-4.7', bestFor: 'knowledge work and long tasks where it double-checks its own answers' },
+    { id: 'deepseek/deepseek-v4.1-flash', bestFor: 'the cheapest option, fine for simple everyday questions' },
   ],
+
   ttsVoice: 'Kore',
   defaultMode: 'smart',
   dailyBudgetUsd: 5,
@@ -109,6 +117,16 @@ export function loadEnvFile(file = paths.env): void {
   for (const [k, v] of Object.entries(parseEnv(text))) {
     if (!process.env[k]) process.env[k] = v;
   }
+}
+
+export function presetIds(cfg: Pick<Config, 'modelPresets'>): string[] {
+  return cfg.modelPresets.map((p) => (typeof p === 'string' ? p : p.id));
+}
+
+/** The configured "best for" note of a preset model, if any. */
+export function presetNote(cfg: Pick<Config, 'modelPresets'>, id: string): string | undefined {
+  const p = cfg.modelPresets.find((x) => typeof x !== 'string' && x.id === id);
+  return typeof p === 'object' ? p.bestFor : undefined;
 }
 
 export function loadConfig(file = paths.config): Config {
