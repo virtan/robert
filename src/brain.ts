@@ -7,6 +7,7 @@ import { dataUrl } from './media.ts';
 import { historyBudget, shortName, type Catalog } from './models.ts';
 import { OpenRouterError, type ChatMessage, type ChatRequest, type ContentPart, type OpenRouter } from './openrouter.ts';
 import { runTool, toolDefinitions, toolsHelp, type Outbox } from './tools.ts';
+import { extractMemories, memoryPrompt } from './memory.ts';
 
 const MAX_STEPS = 8;
 export const NOREPLY = 'NOREPLY';
@@ -126,6 +127,7 @@ export class Brain {
       ownerName: this.ownerName(),
       tools: useTools ? toolsHelp(this.config) : 'None: this model does not support tools. Say so if asked to search, remind or create media.',
       about: this.about(chat, model, historyTokens),
+      memory: this.config.memory ? memoryPrompt(this.db, chat.id, this.config.timezone) : '',
     });
     const ctx = await buildContext({
       db: this.db, config: this.config, chat, model, trigger, reason, system, historyTokens,
@@ -266,6 +268,22 @@ export class Brain {
     } catch {
       return null;
     }
+  }
+
+  // ---- long-term memory
+
+  /** Reads new messages of the chat into long-term memory. Returns the number of changes. */
+  async updateMemories(chatId: number): Promise<number> {
+    if (!this.config.memory || this.overBudget()) return 0;
+    const changes = await extractMemories(this.db, chatId, this.config.timezone, async (system, user) => {
+      const res = await this.or.chat(
+        { model: this.config.models.memory, max_tokens: 3000, temperature: 0, messages: [{ role: 'system', content: system }, { role: 'user', content: user }] },
+        { kind: 'memory', chatId },
+      );
+      return finalText(res.choices[0].message);
+    });
+    if (changes) log.info(`chat ${chatId}: ${changes} memory change(s)`);
+    return changes;
   }
 
   // ---- rolling summary

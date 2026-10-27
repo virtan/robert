@@ -16,6 +16,27 @@ export interface ChatRow {
   summary: string | null;
   /** messages.id of the last message folded into the summary. */
   summary_upto: number;
+  /** messages.id of the last message read for long-term memories. */
+  memory_upto: number;
+}
+
+export const MEMORY_CATEGORIES = ['person', 'date', 'place', 'contact', 'plan', 'event', 'tech', 'preference', 'other'] as const;
+export type MemoryCategory = (typeof MEMORY_CATEGORIES)[number];
+
+/** A durable fact about the chat, with who mentioned it. */
+export interface MemoryRow {
+  id: number;
+  chat_id: number;
+  category: MemoryCategory;
+  /** Who or what it is about, e.g. "Anna" or "the Lisbon trip". */
+  about: string | null;
+  fact: string;
+  said_by: string | null;
+  said_by_id: number | null;
+  /** Telegram id of the message it came from. */
+  source_tg_id: number | null;
+  created_at: number;
+  updated_at: number;
 }
 
 export type MessageKind =
@@ -154,12 +175,27 @@ CREATE TABLE IF NOT EXISTS watches (
   done INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS watches_chat ON watches(chat_id, done);
+CREATE TABLE IF NOT EXISTS memories (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id INTEGER NOT NULL,
+  category TEXT NOT NULL,
+  about TEXT,
+  fact TEXT NOT NULL,
+  said_by TEXT,
+  said_by_id INTEGER,
+  source_tg_id INTEGER,
+  created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  active INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS memories_chat ON memories(chat_id, active, updated_at);
 `;
 
 /** Columns added after the first release; created on old databases at startup. */
 const ADDED_COLUMNS: [table: string, column: string, type: string][] = [
   ['messages', 'edited_at', 'INTEGER'],
   ['messages', 'reply_quote', 'TEXT'],
+  ['chats', 'memory_upto', 'INTEGER NOT NULL DEFAULT 0'],
 ];
 
 const n = (v: unknown): SQLInputValue => (v === undefined ? null : (v as SQLInputValue));
@@ -231,6 +267,7 @@ export class DB {
       this.sql.prepare('UPDATE messages SET chat_id = ? WHERE chat_id = ?').run(to, from);
       this.sql.prepare('UPDATE reminders SET chat_id = ? WHERE chat_id = ?').run(to, from);
       this.sql.prepare('UPDATE watches SET chat_id = ? WHERE chat_id = ?').run(to, from);
+      this.sql.prepare('UPDATE memories SET chat_id = ? WHERE chat_id = ?').run(to, from);
       this.sql.exec('COMMIT');
     } catch (err) {
       this.sql.exec('ROLLBACK');
@@ -357,6 +394,55 @@ export class DB {
     return rows.slice(0, limit);
   }
 
+  // ---- long-term memories
+
+  addMemory(m: Omit<MemoryRow, 'id' | 'created_at' | 'updated_at'>): number {
+    const r = this.sql
+      .prepare('INSERT INTO memories (chat_id, category, about, fact, said_by, said_by_id, source_tg_id) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(m.chat_id, m.category, n(m.about), m.fact, n(m.said_by), n(m.said_by_id), n(m.source_tg_id));
+    return Number(r.lastInsertRowid);
+  }
+
+  updateMemory(chatId: number, id: number, fact: string): boolean {
+    return this.sql
+      .prepare('UPDATE memories SET fact = ?, updated_at = unixepoch() WHERE id = ? AND chat_id = ? AND active = 1')
+      .run(fact, id, chatId).changes > 0;
+  }
+
+  removeMemory(chatId: number, id: number): boolean {
+    return this.sql.prepare('UPDATE memories SET active = 0, updated_at = unixepoch() WHERE id = ? AND chat_id = ? AND active = 1').run(id, chatId).changes > 0;
+  }
+
+  getMemory(chatId: number, id: number): MemoryRow | undefined {
+    return this.sql.prepare('SELECT * FROM memories WHERE id = ? AND chat_id = ? AND active = 1').get(id, chatId) as MemoryRow | undefined;
+  }
+
+  /** Most recently updated first. */
+  listMemories(chatId: number, limit = 1000): MemoryRow[] {
+    return this.sql
+      .prepare('SELECT * FROM memories WHERE chat_id = ? AND active = 1 ORDER BY updated_at DESC, id DESC LIMIT ?')
+      .all(chatId, limit) as unknown as MemoryRow[];
+  }
+
+  countMemories(chatId: number): number {
+    return (this.sql.prepare('SELECT COUNT(*) AS c FROM memories WHERE chat_id = ? AND active = 1').get(chatId) as { c: number }).c;
+  }
+
+  /** Memories containing every word of the query (in the fact, the subject, the category or who said it). */
+  searchMemories(chatId: number, query: string, limit = 30): MemoryRow[] {
+    const words = query.toLowerCase().match(/[\p{L}\p{N}@._-]+/gu) ?? [];
+    return this.listMemories(chatId)
+      .filter((m) => {
+        const hay = [m.fact, m.about, m.category, m.said_by].join(' ').toLowerCase();
+        return words.every((w) => hay.includes(w));
+      })
+      .slice(0, limit);
+  }
+
+  setMemoryUpto(chatId: number, upto: number): void {
+    this.sql.prepare('UPDATE chats SET memory_upto = ? WHERE id = ?').run(upto, chatId);
+  }
+
   // ---- watches
 
   addWatch(w: Omit<WatchRow, 'id'>): number {
@@ -414,7 +500,8 @@ export class DB {
     try {
       this.sql.prepare('DELETE FROM messages_fts WHERE rowid IN (SELECT id FROM messages WHERE chat_id = ?)').run(chatId);
       this.sql.prepare('DELETE FROM messages WHERE chat_id = ?').run(chatId);
-      this.sql.prepare('UPDATE chats SET summary = NULL, summary_upto = 0 WHERE id = ?').run(chatId);
+      this.sql.prepare('DELETE FROM memories WHERE chat_id = ?').run(chatId);
+      this.sql.prepare('UPDATE chats SET summary = NULL, summary_upto = 0, memory_upto = 0 WHERE id = ?').run(chatId);
       this.sql.exec('COMMIT');
     } catch (err) {
       this.sql.exec('ROLLBACK');
@@ -430,6 +517,7 @@ export class DB {
       .all(beforeUnix) as { media_path: string }[]).map((r) => r.media_path);
     this.sql.prepare('DELETE FROM messages_fts WHERE rowid IN (SELECT id FROM messages WHERE date < ?)').run(beforeUnix);
     this.sql.prepare('DELETE FROM messages WHERE date < ?').run(beforeUnix);
+    this.sql.prepare('DELETE FROM memories WHERE updated_at < ?').run(beforeUnix);
     return media;
   }
 

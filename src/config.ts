@@ -27,6 +27,8 @@ export interface Models {
   judge: string;
   /** Model that maintains the rolling summary of older conversation. */
   summary: string;
+  /** Model that picks durable facts for the long-term memory. */
+  memory: string;
   /** Describes images when the chat model can't see them. */
   vision: string;
   /** Speech-to-text for voice, audio and video. */
@@ -67,6 +69,8 @@ export interface Config {
   retentionDays: number;
   /** 'owner': only the owner can DM Robert. 'members': anyone seen in an approved group can. */
   allowDms: 'owner' | 'members';
+  /** Keep long-term memories (people, dates, places, plans…) per chat. */
+  memory: boolean;
   /** Lets the model run JavaScript in an isolated sandbox (QuickJS in WebAssembly) to calculate and check things. */
   runCode: boolean;
 }
@@ -80,6 +84,7 @@ export const DEFAULTS: Config = {
     chat: 'meta/muse-spark-open',
     judge: 'anthropic/claude-haiku-5.5',
     summary: 'anthropic/claude-haiku-5.5',
+    memory: 'anthropic/claude-haiku-5.5',
     vision: 'anthropic/claude-haiku-5.5',
     transcribe: 'openai/gpt-4o-mini-transcribe',
     tts: 'google/gemini-3.8-flash-tts',
@@ -103,6 +108,7 @@ export const DEFAULTS: Config = {
   maxAsksPerUserPerHour: 40,
   retentionDays: 0,
   allowDms: 'owner',
+  memory: true,
   runCode: true,
 };
 

@@ -226,7 +226,7 @@ export function loadTemplate(): string {
 
 export function renderSystem(
   template: string,
-  v: { config: Config; chat: ChatRow; model: string; tools: string; ownerName: string; about?: string },
+  v: { config: Config; chat: ChatRow; model: string; tools: string; ownerName: string; about?: string; memory?: string },
 ): string {
   const { config, chat } = v;
   const aliases = config.names.length > 1 ? `People may also call you ${config.names.slice(1).join(', ')}.` : '';
@@ -243,6 +243,7 @@ export function renderSystem(
     model: v.model,
     tools: v.tools,
     about: v.about ?? '',
+    memory: v.memory ?? '',
     owner: v.ownerName,
     summary,
   };

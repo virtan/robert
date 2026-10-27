@@ -1,7 +1,8 @@
 import fs from 'node:fs';
 import type { Brain } from './brain.ts';
 import { body, displayName, isImage, localTime } from './context.ts';
-import type { ChatRow, MessageRow } from './db.ts';
+import { MEMORY_CATEGORIES, type ChatRow, type MemoryCategory, type MessageRow } from './db.ts';
+import { looksSecret, memoryLine } from './memory.ts';
 import { log } from './log.ts';
 import { dataUrl, extFromMime, saveMedia, toVoiceOgg } from './media.ts';
 import { DEFAULT_ANSWER_SIZE, describeModel, isGeneric, modelEntry, switchNote, wantsMore } from './models.ts';
@@ -28,7 +29,7 @@ const fn = (name: string, description: string, properties: Record<string, unknow
   function: { name, description, parameters: { type: 'object', properties, required, additionalProperties: false } },
 });
 
-export function toolDefinitions(opts: { runCode: boolean }): Tool[] {
+export function toolDefinitions(opts: { runCode: boolean; memory: boolean }): Tool[] {
   return [
     { type: 'openrouter:web_search', parameters: { max_results: 5 } },
     { type: 'openrouter:web_fetch', parameters: { max_content_tokens: 12000 } },
@@ -68,6 +69,20 @@ export function toolDefinitions(opts: { runCode: boolean }): Tool[] {
       text: { type: 'string', description: 'Exactly what to say. Plain spoken language, no Markdown.' },
       style: { type: 'string', description: 'Optional delivery instructions, e.g. "cheerful", "slowly".' },
     }, ['text']),
+    ...(opts.memory ? [
+      fn('remember', 'Save a durable fact to this chat\'s long-term memory, e.g. when asked to remember something.', {
+        category: { type: 'string', enum: [...MEMORY_CATEGORIES] },
+        about: { type: 'string', description: 'Who or what it concerns.' },
+        fact: { type: 'string', description: 'The fact, standing on its own: names, full dates, exact numbers.' },
+      }, ['category', 'fact']),
+      fn('search_memory', 'Search this chat\'s long-term memory (facts noted from earlier conversations).', {
+        query: { type: 'string', description: 'Words to look for, e.g. a name, place or topic.' },
+      }, ['query']),
+      fn('forget_memory', 'Delete a fact from long-term memory, or correct it by passing a new fact.', {
+        id: { type: 'integer' },
+        new_fact: { type: 'string', description: 'Optional corrected text; omit to delete.' },
+      }, ['id']),
+    ] : []),
     ...(opts.runCode ? [fn('run_js', 'Run JavaScript in an isolated sandbox and get its output: for arithmetic, counting, ' +
       'dates, puzzles and brute-force checks. Synchronous ES2023 with BigInt; no network, files, timers or modules. ' +
       'Print with console.log; the value of the last expression is returned too. Limits: 5 s, 64 MB.', {
@@ -86,8 +101,10 @@ export function toolDefinitions(opts: { runCode: boolean }): Tool[] {
   ];
 }
 
-export function toolsHelp(opts: { runCode: boolean }): string {
-  return TOOLS_HELP + (opts.runCode ? '\n- run_js: run JavaScript in a sandbox to calculate, count or brute-force; trust its output over mental math.' : '');
+export function toolsHelp(opts: { runCode: boolean; memory: boolean }): string {
+  return TOOLS_HELP +
+    (opts.memory ? '\n- remember / search_memory / forget_memory: the chat\'s long-term memory. Facts are also noted automatically; use remember when asked to.' : '') +
+    (opts.runCode ? '\n- run_js: run JavaScript in a sandbox to calculate, count or brute-force; trust its output over mental math.' : '');
 }
 
 const TOOLS_HELP = `- Web search and web page fetching for anything current or outside your knowledge.
@@ -117,6 +134,12 @@ export async function runTool(name: string, rawArgs: string, env: ToolEnv): Prom
         if (args.kind === 'watch') return env.brain.db.cancelWatch(env.chat.id, Number(args.id)) ? 'Cancelled.' : 'No such waiting task in this chat.';
         return env.brain.db.cancelReminder(env.chat.id, Number(args.id)) ? 'Cancelled.' : 'No such active reminder in this chat.';
       case 'watch_for_message': return watchForMessage(env, args);
+      case 'remember': return remember(env, args);
+      case 'search_memory': {
+        const found = env.brain.db.searchMemories(env.chat.id, String(args.query ?? ''));
+        return found.length ? found.map((m) => memoryLine(m, env.brain.config.timezone)).join('\n') : 'No memories match.';
+      }
+      case 'forget_memory': return forgetMemory(env, args);
       case 'run_js':
         if (!env.brain.config.runCode) return 'Error: code execution is disabled.';
         return await runJs(String(args.code ?? ''));
@@ -145,6 +168,37 @@ function searchHistory(env: ToolEnv, a: Record<string, unknown>): string {
       return `#${m.tg_id} ${localTime(m.date, tz, true)}${edited} ${m.is_self ? 'you' : displayName(m)}:\n${body(m).slice(0, 2000)}`;
     })
     .join('\n\n');
+}
+
+function remember(env: ToolEnv, a: Record<string, unknown>): string {
+  const { brain, chat, trigger } = env;
+  if (!brain.config.memory) return 'Error: long-term memory is turned off.';
+  const fact = String(a.fact ?? '').trim();
+  if (!fact) return 'Error: nothing to remember.';
+  if (looksSecret(fact)) return 'Refused: that looks like a password, key or card number, which must not be stored. Tell the user.';
+  const category = (MEMORY_CATEGORIES as readonly string[]).includes(String(a.category)) ? (a.category as MemoryCategory) : 'other';
+  const id = brain.db.addMemory({
+    chat_id: chat.id, category, about: a.about ? String(a.about).slice(0, 120) : null, fact: fact.slice(0, 500),
+    said_by: trigger.user_name || trigger.username, said_by_id: trigger.user_id, source_tg_id: trigger.tg_id,
+  });
+  return `Saved as memory #${id}.`;
+}
+
+function forgetMemory(env: ToolEnv, a: Record<string, unknown>): string {
+  const { brain, chat, trigger } = env;
+  const m = brain.db.getMemory(chat.id, Number(a.id));
+  if (!m) return 'No such memory in this chat.';
+  if (trigger.user_id !== brain.config.ownerId && trigger.user_id !== m.said_by_id) {
+    return 'Refused: only the owner or the person who mentioned it can change this memory. Tell the user.';
+  }
+  const fixed = a.new_fact ? String(a.new_fact).trim() : '';
+  if (fixed) {
+    if (looksSecret(fixed)) return 'Refused: that looks like a secret, which must not be stored.';
+    brain.db.updateMemory(chat.id, m.id, fixed.slice(0, 500));
+    return `Memory #${m.id} corrected.`;
+  }
+  brain.db.removeMemory(chat.id, m.id);
+  return `Memory #${m.id} deleted.`;
 }
 
 function watchForMessage(env: ToolEnv, a: Record<string, unknown>): string {

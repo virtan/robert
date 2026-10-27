@@ -28,7 +28,10 @@ Robert: Done: reminder set for Thu 09:00.
 - **Follows the thread.** It sees edits, and each reply carries a quote of the message it answers,
   even one sent before Robert joined.
 - **Remembers.** Every message is stored in a local SQLite database. Older conversation is folded
-  into a rolling summary, so context stays small and cheap.
+  into a rolling summary, so context stays small and cheap. On top of that, Robert keeps a
+  long-term memory per chat: people, dates, addresses, contacts and wallet addresses, plans, big
+  events, places and technologies, each with who mentioned it. It never stores passwords, keys,
+  seed phrases or card numbers.
 - **Any model, switchable from Telegram.** Use `/model opus`, tap a preset, or say "Robert, switch
   to Gemini Flash" (owner only). Ask "which models are there?" for a short list with what each
   is best for and roughly what an answer costs. It detects model capabilities (vision, audio,
@@ -109,9 +112,11 @@ Commands:
 | `/mode smart\|direct` | owner | *smart* also answers implicit requests; *direct* only answers when addressed |
 | `/names <list>` | owner | Names and nicknames Robert answers to, e.g. `/names Robert, Rob, Роберт*, Роб` |
 | `/status` | everyone | Model, mode, today's spending, memory size |
-| `/summary` | everyone | What Robert remembers from earlier |
+| `/summary` | everyone | Summary of the recent conversation |
+| `/memory [words]` | everyone | Long-term memories of this chat, or the ones matching the words |
+| `/memory forget <id>` | owner | Delete one memory (people can also ask Robert to correct facts they mentioned) |
 | `/budget <usd>` | owner | Daily spending limit (0 = unlimited) |
-| `/forget` | owner | Erase this chat's stored messages and media |
+| `/forget` | owner | Erase this chat's stored messages, media and memories |
 | `/leave` | owner | Remove Robert from the group |
 
 The owner can also ask in plain language: "Robert, switch to Claude Opus for this chat".
@@ -136,6 +141,7 @@ Robert uses several models, each configurable in `config.json`:
 | `chat` | `meta/muse-spark-open` | Answers (switchable per chat with `/model`) |
 | `judge` | `anthropic/claude-haiku-5.5` | Deciding whether an implicit message is meant for Robert |
 | `summary` | `anthropic/claude-haiku-5.5` | Rolling summary of older conversation |
+| `memory` | `anthropic/claude-haiku-5.5` | Picking durable facts for the long-term memory |
 | `vision` | `anthropic/claude-haiku-5.5` | Describing images for models that can't see; `look_at` |
 | `transcribe` | `openai/gpt-4o-mini-transcribe` | Voice, audio and video transcription |
 | `tts` | `google/gemini-3.8-flash-tts` | Voice replies (voice `Kore`, set with `ttsVoice`) |
@@ -150,6 +156,8 @@ What costs money in an active group:
   what was said.
 - **In smart mode, each burst of messages costs one small judge call.** Bursts are messages within
   a few seconds of each other. Use `/mode direct` to switch this off.
+- **Long-term memory** costs one small call per 30 messages, or when a chat goes quiet for
+  15 minutes. Set `"memory": false` to turn it off.
 - **Answers** cost whatever the chosen model costs.
 
 The daily budget (default $5) stops all paid calls for the rest of the UTC day once it's reached.
@@ -190,6 +198,7 @@ Environment variables take precedence over `.env`, so you can also run Robert wi
   "maxAsksPerUserPerHour": 40,        // the owner is exempt
   "retentionDays": 0,                 // delete older messages and media; 0 = keep forever
   "allowDms": "owner",                // or "members"
+  "memory": true,                     // long-term memory of people, dates, places, plans…
   "runCode": true                     // false removes the run_js sandbox tool
 }
 ```
@@ -226,9 +235,12 @@ Run only one instance per bot token. Telegram delivers each update to a single p
 
 ## Privacy and security
 
-- Robert stores every message from approved chats, plus downloaded media, on your server. It tells
-  the group so in its greeting and in `/help`. `/forget` erases a chat, and `retentionDays` sets an
-  automatic expiry.
+- Robert stores every message from approved chats, plus downloaded media and long-term memories,
+  on your server. It tells the group so in its greeting and in `/help`. Anyone can see the
+  memories with `/memory`. `/forget` erases a chat, and `retentionDays` sets an automatic expiry
+  (for memories, counted from their last update).
+- Memories never include passwords, private keys, seed phrases, card numbers or one-time codes:
+  the model is told not to record them, and a filter in code drops anything that looks like one.
 - Message content is sent to OpenRouter and the model provider you choose. Pick providers whose
   data policy you accept (OpenRouter has
   [privacy settings and ZDR routing](https://openrouter.ai/settings/privacy)).
@@ -271,6 +283,7 @@ npm run typecheck
 | `src/context.ts` | Turns stored messages into the model's context, within a token budget |
 | `src/tools.ts` | Tools the model can call (history search, reminders, waiting tasks, code, images, voice, models) |
 | `src/sandbox/` | The isolated JavaScript sandbox behind `run_js` |
+| `src/memory.ts` | Long-term memory: picking facts, the secret filter, the prompt section |
 | `src/openrouter.ts` | Minimal OpenRouter client: chat, transcription, speech, images, models |
 | `src/db.ts` | SQLite schema and queries (`node:sqlite`, full-text search with FTS5) |
 | `src/setup/` | Setup wizard and @BotFather automation (GramJS) |

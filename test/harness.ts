@@ -30,6 +30,8 @@ export class Harness {
   /** Responses for main-model chat calls, consumed in order. */
   readonly chatReplies: ChatReply[] = [];
   judgeReply: Record<string, unknown> = { respond: false };
+  /** What the memory model returns: {add, update, remove}. */
+  memoryReply: Record<string, unknown> = { add: [], update: [], remove: [] };
   transcript = 'hello there';
   readonly config: Config;
   readonly db: DB;
@@ -38,7 +40,7 @@ export class Harness {
   private nextId = 1000;
   private updateId = 1;
 
-  constructor(over: Partial<Config> = {}) {
+  constructor(over: Partial<Config> = {}, opts: { memoryIdleMs?: number } = {}) {
     this.dir = fs.mkdtempSync(path.join(os.tmpdir(), 'robert-test-'));
     this.config = structuredClone({ ...DEFAULTS, ownerId: OWNER.id, botUsername: BOT.username, timezone: 'UTC', ...over });
     this.db = new DB(':memory:');
@@ -56,7 +58,7 @@ export class Harness {
       this.calls.push({ method, payload: payload as Record<string, unknown> });
       return { ok: true, result: this.telegramResult(method, payload as Record<string, unknown>) } as never;
     });
-    this.robert = new Robert({ bot, brain, token: '123:TEST', fetch: this.fileFetch, judgeDebounceMs: 5 });
+    this.robert = new Robert({ bot, brain, token: '123:TEST', fetch: this.fileFetch, judgeDebounceMs: 5, memoryIdleMs: opts.memoryIdleMs });
   }
 
   close(): void {
@@ -84,6 +86,7 @@ export class Harness {
     if (p === '/images') return json({ data: [{ b64_json: Buffer.from('png').toString('base64'), media_type: 'image/png' }], usage: { cost: 0.04 } });
     if (p === '/chat/completions') {
       if (isJudge(body)) return json(completion(JSON.stringify(this.judgeReply)));
+      if (isMemory(body)) return json(completion(JSON.stringify(this.memoryReply)));
       const next = this.chatReplies.shift() ?? completion('default answer');
       return json(typeof next === 'function' ? await next(body) : next);
     }
@@ -124,7 +127,11 @@ export class Harness {
   }
 
   mainRequests() {
-    return this.orRequests.filter((r) => r.path === '/chat/completions' && !isJudge(r.body));
+    return this.orRequests.filter((r) => r.path === '/chat/completions' && !isJudge(r.body) && !isMemory(r.body));
+  }
+
+  memoryRequests() {
+    return this.orRequests.filter((r) => r.path === '/chat/completions' && isMemory(r.body));
   }
 }
 
@@ -149,3 +156,4 @@ export const mention = (text: string) => ({
 export const command = (text: string) => ({ text, entities: [{ type: 'bot_command' as const, offset: 0, length: text.split(' ')[0].length }] });
 
 const isJudge = (body: Record<string, unknown>) => JSON.stringify(body.messages ?? '').includes('You watch a Telegram group chat');
+const isMemory = (body: Record<string, unknown>) => JSON.stringify(body.messages ?? '').includes('long-term memory of a Telegram group chat');

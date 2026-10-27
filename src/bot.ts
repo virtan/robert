@@ -13,6 +13,7 @@ import { OpenRouterError } from './openrouter.ts';
 import type { Outbox } from './tools.ts';
 import { isCommandForOtherBot, isDirect, nameRegex, parseCommand, realReplyTo, type Command } from './triggers.ts';
 import { snippet } from './context.ts';
+import { MEMORY_EVERY, MEMORY_IDLE_MS, MEMORY_MIN_NEW, memoryLine } from './memory.ts';
 
 const JUDGE_DEBOUNCE_MS = 3000;
 const JUDGE_MAX_WAIT_MS = 10_000;
@@ -31,6 +32,8 @@ export interface RobertDeps {
   fetch?: typeof fetch;
   /** How long to wait for a burst of messages to end before judging it. */
   judgeDebounceMs?: number;
+  /** How long a chat must be quiet before new messages are read into long-term memory. */
+  memoryIdleMs?: number;
 }
 
 type Queue = Map<number, Promise<void>>;
@@ -50,6 +53,10 @@ export class Robert {
   /** Per chat, the newest message id that an answer already took into account. */
   private readonly answeredUpto = new Map<number, number>();
   private readonly lastErrorNotice = new Map<number, number>();
+  private readonly memoryQ: Queue = new Map();
+  private readonly sinceMemory = new Map<number, number>();
+  private readonly memoryTimers = new Map<number, NodeJS.Timeout>();
+  private readonly memoryIdleMs: number;
   private timers: NodeJS.Timeout[] = [];
   private names: RegExp | null;
   private readonly judgeDebounceMs: number;
@@ -60,6 +67,7 @@ export class Robert {
     this.token = deps.token;
     this.fetch = deps.fetch ?? globalThis.fetch;
     this.judgeDebounceMs = deps.judgeDebounceMs ?? JUDGE_DEBOUNCE_MS;
+    this.memoryIdleMs = deps.memoryIdleMs ?? MEMORY_IDLE_MS;
     this.names = nameRegex(this.brain.config.names);
     this.install();
   }
@@ -125,8 +133,9 @@ export class Robert {
   async stop(): Promise<void> {
     for (const t of this.timers) clearInterval(t);
     for (const j of this.judging.values()) clearTimeout(j.timer);
+    for (const t of this.memoryTimers.values()) clearTimeout(t);
     await this.bot.stop();
-    await Promise.allSettled([...this.ingestQ.values(), ...this.replyQ.values()]);
+    await Promise.allSettled([...this.ingestQ.values(), ...this.replyQ.values(), ...this.memoryQ.values()]);
   }
 
   /** Runs tasks for one chat in order, without blocking other chats or the update loop. */
@@ -142,7 +151,7 @@ export class Robert {
   /** Resolves when all queued work has finished (used by tests). */
   async idle(): Promise<void> {
     for (let i = 0; i < 400; i++) {
-      const all = [...this.ingestQ.values(), ...this.replyQ.values()];
+      const all = [...this.ingestQ.values(), ...this.replyQ.values(), ...this.memoryQ.values()];
       if (!all.length && !this.judging.size) return;
       await Promise.allSettled(all);
       await new Promise((r) => setTimeout(r, 5));
@@ -175,6 +184,7 @@ export class Robert {
       return;
     }
     this.countForSummary(chat.id);
+    this.countForMemory(chat.id);
     if (msg.from?.is_bot || isCommandForOtherBot(msg, this.me.username)) {
       log.debug(`chat ${chat.id} #${msg.message_id}: skipped (from a bot or a command for another bot)`);
       return;
@@ -490,6 +500,24 @@ export class Robert {
     });
   }
 
+  /** Reads new messages into long-term memory every MEMORY_EVERY messages, or when the chat goes quiet. */
+  private countForMemory(chatId: number): void {
+    if (!this.cfg.memory) return;
+    const n = (this.sinceMemory.get(chatId) ?? 0) + 1;
+    this.sinceMemory.set(chatId, n);
+    clearTimeout(this.memoryTimers.get(chatId));
+    if (n >= MEMORY_EVERY) this.runMemory(chatId);
+    else if (n >= MEMORY_MIN_NEW) this.memoryTimers.set(chatId, setTimeout(() => this.runMemory(chatId), this.memoryIdleMs).unref());
+  }
+
+  private runMemory(chatId: number): void {
+    this.sinceMemory.set(chatId, 0);
+    this.memoryTimers.delete(chatId);
+    this.enqueue(this.memoryQ, chatId, async () => {
+      await this.brain.updateMemories(chatId).catch((err) => log.warn(`chat ${chatId}: memory update failed:`, err.message));
+    });
+  }
+
   // ---- sending
 
   readonly outbox: Outbox = {
@@ -746,6 +774,25 @@ export class Robert {
         ].join('\n'));
         break;
       }
+      case 'memory': {
+        const forget = cmd.args.match(/^(?:forget|delete|del)\s+#?(\d+)$/i);
+        if (forget) {
+          if (!isOwner) {
+            await reply('Only the owner can delete memories here; anyone can ask me to correct one they mentioned.');
+            break;
+          }
+          await reply(this.db.removeMemory(chat.id, Number(forget[1])) ? 'Deleted.' : 'No such memory.');
+          break;
+        }
+        const list = cmd.args ? this.db.searchMemories(chat.id, cmd.args, 30) : this.db.listMemories(chat.id, 30);
+        const total = this.db.countMemories(chat.id);
+        await reply(list.length
+          ? `${cmd.args ? 'Matching memories' : `Long-term memory (${total} facts${total > list.length ? `, newest ${list.length} shown` : ''})`}:\n` +
+            list.map((m) => `• ${memoryLine(m, this.cfg.timezone)}`).join('\n') +
+            (isOwner ? '\n\nDelete one with /memory forget <id>, or everything with /forget.' : '')
+          : this.cfg.memory ? 'Nothing noted yet.' : 'Long-term memory is turned off.');
+        break;
+      }
       case 'summary':
         await reply(chat.summary ? `What I remember from earlier:\n\n${chat.summary}` : 'Nothing summarized yet; I still see the whole recent conversation.');
         break;
@@ -823,7 +870,8 @@ const COMMANDS: Record<string, { owner?: boolean; menu?: string }> = {
   mode: { owner: true, menu: 'When I join the conversation' },
   names: { owner: true },
   status: { menu: 'Model, spending and memory' },
-  summary: { menu: 'What I remember from earlier' },
+  summary: { menu: 'Summary of the recent conversation' },
+  memory: { menu: 'Facts I keep long-term' },
   forget: { owner: true, menu: 'Erase this chat from my memory' },
   budget: { owner: true },
   approve: { owner: true },
@@ -838,9 +886,10 @@ function helpText(name: string, username: string, owner: boolean): string {
     '/model — show the current AI model',
     '/models — recommended models with strengths and costs (/models all, /models <words>)',
     '/status — model, spending and memory',
-    '/summary — what I remember from earlier',
+    '/summary — summary of the recent conversation',
+    '/memory [words] — facts I keep long-term (people, dates, places, plans…)',
     ...(owner
-      ? ['', 'Owner only:', '/model <name> — use another model here (/model global <name> for all chats)', '/mode smart|direct — whether I also answer implicit requests', '/names <list> — names and nicknames I answer to', '/budget <usd> — daily spending limit', '/forget — erase this chat from my memory', '/leave — remove me from this group']
+      ? ['', 'Owner only:', '/model <name> — use another model here (/model global <name> for all chats)', '/mode smart|direct — whether I also answer implicit requests', '/names <list> — names and nicknames I answer to', '/budget <usd> — daily spending limit', '/memory forget <id> — delete one memory', '/forget — erase this chat from my memory', '/leave — remove me from this group']
       : []),
     '',
     'Everything said here is stored on my server so I can remember context.',

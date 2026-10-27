@@ -70,6 +70,7 @@ export async function runDoctor(): Promise<boolean> {
       check('chat', cfg.models.chat, chat);
       check('judge', cfg.models.judge, chat);
       check('summary', cfg.models.summary, chat);
+      check('memory', cfg.models.memory, chat);
       check('vision', cfg.models.vision, chat);
       check('transcribe', cfg.models.transcribe, stt);
       check('tts', cfg.models.tts, speech);
