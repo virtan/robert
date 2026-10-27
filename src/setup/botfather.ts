@@ -3,6 +3,7 @@
  * (MTProto). Bots can't be created through the Bot API, so this is the only way to automate it.
  * The user session lives only in memory and is logged out at the end.
  */
+import { loginUser } from './telegram-login.ts';
 import { askRequired, askSecret, choose, dim, fail, ok, say, warn } from './ui.ts';
 
 export interface CreatedBot {
@@ -51,19 +52,15 @@ export async function createBotWithUserAccount(opts: {
     baseLogger: new Logger(LogLevel.NONE),
   });
 
-  await client.start({
-    phoneNumber: () => askRequired('Your phone number, international format (e.g. +14155550123)'),
-    phoneCode: () => askRequired('The login code Telegram just sent you (look in the Telegram app)'),
-    password: (hint?: string) => askSecret(`Two-step verification password${hint ? ` (hint: ${hint})` : ''}`),
-    onError: async (err: Error) => {
-      fail(err.message);
-      // Stop on errors that retrying can't fix.
-      return /API_ID|API_HASH|BANNED|FLOOD|AUTH_RESTART/i.test(err.message);
-    },
-  });
+  let me: InstanceType<typeof Api.User>;
+  try {
+    me = await loginUser(client, Api, opts.apiId, opts.apiHash);
+  } catch (err) {
+    await client.destroy().catch(() => {});
+    throw err;
+  }
 
   try {
-    const me = (await client.getMe()) as InstanceType<typeof Api.User>;
     const ownerId = Number(me.id.toString());
     const ownerName = [me.firstName, me.lastName].filter(Boolean).join(' ') || me.username || String(ownerId);
     ok(`Logged in as ${ownerName}${me.username ? ` (@${me.username})` : ''}`);

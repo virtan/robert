@@ -4,8 +4,8 @@ import { body, displayName, isImage, localTime } from './context.ts';
 import type { ChatRow, MessageRow } from './db.ts';
 import { log } from './log.ts';
 import { dataUrl, extFromMime, saveMedia, toVoiceOgg } from './media.ts';
-import { describeModel } from './models.ts';
-import type { Tool } from './openrouter.ts';
+import { describeModel, isGeneric, modelLine } from './models.ts';
+import type { CatalogModel, Tool } from './openrouter.ts';
 import { parseWhen } from './time.ts';
 
 /** How tools reach Telegram. Implemented by the bot; faked in tests. */
@@ -55,7 +55,11 @@ export function toolDefinitions(): Tool[] {
       text: { type: 'string', description: 'Exactly what to say. Plain spoken language, no Markdown.' },
       style: { type: 'string', description: 'Optional delivery instructions, e.g. "cheerful", "slowly".' },
     }, ['text']),
-    fn('find_models', 'Search the OpenRouter model catalog.', { query: { type: 'string' } }, ['query']),
+    fn('find_models', 'List AI models Robert can use. Without a query, returns a short list of well-known current models: ' +
+      'show it as a compact list of the short names (e.g. "Claude Opus 5.5", "Grok 4.7"), not ids or routers. ' +
+      'With a query such as "opus" or "gemini flash", searches the whole OpenRouter catalog.', {
+      query: { type: 'string', description: 'Optional model name words. Leave empty to list well-known models.' },
+    }),
     fn('switch_model', 'Change the AI model Robert uses. Only works when the owner asked.', {
       query: { type: 'string', description: 'Model id or a loose name like "opus" or "gemini flash".' },
       scope: { type: 'string', enum: ['chat', 'global'], description: 'This chat only (default) or the default for all chats.' },
@@ -195,9 +199,15 @@ async function sendVoice(env: ToolEnv, a: Record<string, unknown>): Promise<stri
 
 async function findModels(env: ToolEnv, a: Record<string, unknown>): Promise<string> {
   await env.brain.catalog.ensure();
-  const { candidates } = env.brain.catalog.resolve(String(a.query ?? ''));
-  if (!candidates.length) return 'No models match.';
-  return candidates.map((m) => describeModel(m, m.id)).join('\n');
+  const query = String(a.query ?? '');
+  const current = env.brain.modelFor(env.chat);
+  const mark = (m: CatalogModel) => `${m.id === current ? '(current) ' : ''}${modelLine(m)}`;
+  if (isGeneric(query)) {
+    return 'Well-known models (more exist; search by name):\n' + env.brain.catalog.featured(env.brain.config.modelPresets).map(mark).join('\n');
+  }
+  const { candidates } = env.brain.catalog.resolve(query);
+  if (!candidates.length) return 'No models match. Call find_models without a query for the list of well-known models.';
+  return candidates.map(mark).join('\n');
 }
 
 async function switchModel(env: ToolEnv, a: Record<string, unknown>): Promise<string> {

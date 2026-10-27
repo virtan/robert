@@ -7,7 +7,7 @@ import { log } from './log.ts';
 import {
   audioFormat, decodeText, extFromMime, isTextDocument, MAX_DOWNLOAD, removeMedia, saveMedia, toSpeechMp3, videoFrame,
 } from './media.ts';
-import { describeModel } from './models.ts';
+import { describeModel, isGeneric, modelLine, shortName } from './models.ts';
 import { OpenRouterError } from './openrouter.ts';
 import type { Outbox } from './tools.ts';
 import { isCommandForOtherBot, isDirect, nameRegex, parseCommand, realReplyTo, type Command } from './triggers.ts';
@@ -591,7 +591,11 @@ export class Robert {
         const current = this.brain.modelFor(chat);
         if (!cmd.args) {
           const kb = new InlineKeyboard();
-          this.cfg.modelPresets.forEach((id, i) => kb.text(id === current ? `• ${id}` : id, `md:${i}`).row());
+          this.cfg.modelPresets.forEach((id, i) => {
+            const m = this.brain.catalog.get(id);
+            const label = m ? shortName(m) : id;
+            kb.text(id === current ? `• ${label}` : label, `md:${i}`).row();
+          });
           kb.text('Reset to default', 'md:default');
           await reply(`Current model: ${describeModel(this.brain.catalog.get(current), current)}` +
             (isOwner ? '\n\nPick one, or send /model <name>. Use /model global <name> to change the default everywhere.' : ''),
@@ -626,8 +630,14 @@ export class Robert {
         break;
       }
       case 'models': {
-        const { candidates } = cmd.args ? this.brain.catalog.resolve(cmd.args) : { candidates: this.cfg.modelPresets.map((id) => this.brain.catalog.get(id)).filter((m) => !!m) };
-        await reply(candidates.length ? candidates.map((m) => `• ${describeModel(m, m.id)}`).join('\n') : 'No models match.');
+        await this.brain.catalog.ensure();
+        const current = this.brain.modelFor(chat);
+        const generic = isGeneric(cmd.args);
+        const list = generic ? this.brain.catalog.featured(this.cfg.modelPresets) : this.brain.catalog.resolve(cmd.args).candidates;
+        await reply(list.length
+          ? (generic ? 'Well-known models (search others with /models <words>):\n' : '') +
+            list.map((m) => `${m.id === current ? '▸' : '•'} ${modelLine(m)}`).join('\n')
+          : 'No models match.');
         break;
       }
       case 'mode': {
@@ -744,7 +754,7 @@ function helpText(name: string, username: string, owner: boolean): string {
     'I can search the web, read links, photos, PDFs and voice messages, search our chat history, set reminders, draw images and talk.',
     '',
     '/model — show the current AI model',
-    '/models <words> — search available models',
+    '/models — well-known models; /models <words> searches all',
     '/status — model, spending and memory',
     '/summary — what I remember from earlier',
     ...(owner

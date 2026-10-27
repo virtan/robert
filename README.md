@@ -57,7 +57,10 @@ The wizard does five things:
 1. **OpenRouter:** asks for your API key and validates it.
 2. **Telegram bot:** creates one automatically, or accepts a token you paste.
    - *Automatic:* you enter an `api_id`/`api_hash` from [my.telegram.org](https://my.telegram.org),
-     your phone number and the login code. The wizard then talks to @BotFather for you: it creates
+     then log in by scanning a QR code with the Telegram app (Settings → Devices → Link Desktop
+     Device), or with your phone number and a login code. The wizard says where Telegram sent the
+     code (usually as a message from "Telegram" inside the app, not by SMS) and can re-send it by SMS
+     or call. Then it talks to @BotFather for you: it creates
      the bot, disables group privacy mode, sets a description, and can add the bot to one of your
      groups. It ends by **logging out the temporary session**. Your account credentials are never
      written to disk.
@@ -94,7 +97,8 @@ Commands:
 | `/model <name>` | owner | Switch this chat's model, e.g. `/model opus`, `/model google/gemini-3.8-flash` |
 | `/model global <name>` | owner | Change the default model for all chats |
 | `/model default` | owner | Make this chat use the default model again |
-| `/models <words>` | everyone | Search OpenRouter models, with prices and capabilities |
+| `/models` | everyone | Well-known current models (the newest of each major family), with prices |
+| `/models <words>` | everyone | Search all OpenRouter models, e.g. `/models grok` |
 | `/mode smart\|direct` | owner | *smart* also answers implicit requests; *direct* only answers when addressed |
 | `/status` | everyone | Model, mode, today's spending, memory size |
 | `/summary` | everyone | What Robert remembers from earlier |

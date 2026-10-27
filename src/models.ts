@@ -7,6 +7,42 @@ export type Capability = 'image' | 'audio' | 'file' | 'video' | 'tools';
 
 const REFRESH_MS = 6 * 3600_000;
 
+/** Well-known model lines. featured() shows the newest usable model of each, so the list stays current. */
+const FAMILIES: RegExp[] = [
+  /^anthropic\/claude-opus-[\d.]+$/,
+  /^anthropic\/claude-sonnet-[\d.]+$/,
+  /^anthropic\/claude-haiku-[\d.]+$/,
+  /^openai\/gpt-[\d.]+(-[a-z]+)?$/,
+  /^google\/gemini-[\d.]+-(?!flash)[a-z]+$/,
+  /^google\/gemini-[\d.]+-flash$/,
+  /^x-ai\/grok-[\d.]+$/,
+  /^meta\/muse-wonder(-[\d.]+)?$/,
+  /^meta\/muse-spark(-[\d.]+)?(-open)?$/,
+  /^deepseek\/deepseek-v[\d.]+(-pro|-flash)?$/,
+  /^moonshotai\/kimi-k[\d.]+(-pro)?$/,
+  /^qwen\/qwen[\d.]+-max/,
+  /^mistralai\/mistral-large/,
+  /^z-ai\/glm-[\d.]+$/,
+];
+
+/** Words that say nothing about which model is meant ("what models are available?"). */
+const GENERIC = new Set(['model', 'models', 'available', 'list', 'all', 'best', 'popular', 'top', 'show', 'which', 'llm', 'llms', 'модель', 'модели', 'доступные', 'список']);
+
+/**
+ * Routers, variants and moving aliases ("openrouter/free", "…:batch", "~…-latest") are rarely what
+ * someone means by a model name. Returns the part that makes the id special, so a query that names
+ * it ("free", "latest") still finds it.
+ */
+function variantMarker(id: string): string | null {
+  if (id.startsWith('openrouter/')) return id;
+  if (id.startsWith('~')) return 'latest';
+  if (id.includes(':')) return id.slice(id.indexOf(':') + 1);
+  return null;
+}
+
+/** Previews and experiments. */
+const unstable = (id: string) => /preview|-exp\b|experimental|beta|contributor/.test(id);
+
 /** OpenRouter's model list, cached on disk, used for capability checks and model switching. */
 export class Catalog {
   private byId = new Map<string, CatalogModel>();
@@ -67,12 +103,17 @@ export class Catalog {
    */
   resolve(query: string): { match?: CatalogModel; candidates: CatalogModel[] } {
     const q = query.trim().toLowerCase();
-    if (!q) return { candidates: [] };
+    if (!q || isGeneric(q)) return { candidates: [] };
     const exact = this.byId.get(q) ?? this.byId.get(query.trim());
     if (exact) return { match: exact, candidates: [exact] };
 
     const words = tokenize(q);
-    const chatModels = [...this.byId.values()].filter((m) => m.architecture.output_modalities.includes('text'));
+    // Batch variants, routers and the like only show up when the query names them.
+    const chatModels = [...this.byId.values()].filter((m) => {
+      if (!m.architecture.output_modalities.includes('text')) return false;
+      const marker = variantMarker(m.id);
+      return !marker || words.some((w) => marker.includes(w));
+    });
     const scored = chatModels
       .map((m) => {
         const hay = new Set([...tokenize(m.id), ...tokenize(m.name)]);
@@ -84,7 +125,7 @@ export class Catalog {
           else return null;
         }
         if (m.id.endsWith(':free')) score -= 0.5;
-        if (/preview|beta|experimental/.test(m.id)) score -= 0.25;
+        if (unstable(m.id) || this.isDatedTwin(m.id)) score -= 0.25;
         return { m, score };
       })
       .filter((x): x is { m: CatalogModel; score: number } => x !== null)
@@ -92,6 +133,36 @@ export class Catalog {
     const candidates = scored.slice(0, 8).map((x) => x.m);
     return { match: candidates[0], candidates };
   }
+
+  /** A dated snapshot ("…-flash-1017") of a model that also has an undated id. */
+  private isDatedTwin(id: string): boolean {
+    return /-\d{4}$/.test(id) && this.byId.has(id.replace(/-\d{4}$/, ''));
+  }
+
+  /**
+   * A short list of well-known, current chat models: the presets first, then the newest usable
+   * model of each family in FAMILIES.
+   */
+  featured(presets: string[] = []): CatalogModel[] {
+    const usable = (m: CatalogModel) =>
+      m.architecture.output_modalities.includes('text') && !variantMarker(m.id) && !unstable(m.id) && !this.isDatedTwin(m.id) && !!m.supported_parameters?.includes('tools');
+    const out = new Map<string, CatalogModel>();
+    for (const id of presets) {
+      const m = this.byId.get(id);
+      if (m) out.set(id, m);
+    }
+    const all = [...this.byId.values()].filter(usable).sort((a, b) => b.created - a.created);
+    for (const family of FAMILIES) {
+      const m = all.find((x) => family.test(x.id));
+      if (m) out.set(m.id, m);
+    }
+    return [...out.values()];
+  }
+}
+
+/** True for queries like "available models" that name no model at all. */
+export function isGeneric(query: string): boolean {
+  return tokenize(query.toLowerCase()).every((w) => GENERIC.has(w));
 }
 
 function tokenize(s: string): string[] {
@@ -108,4 +179,20 @@ export function describeModel(m: CatalogModel | undefined, id: string): string {
   return `${m.id} — ${m.name}; ${price(m.pricing.prompt)}/${price(m.pricing.completion)} per M tokens` +
     (inputs.length ? `; sees ${inputs.join(', ')}` : '; text only') +
     (m.supported_parameters?.includes('tools') ? '' : '; no tools');
+}
+
+/** "Anthropic: Claude Opus 5.5" → "Claude Opus 5.5". */
+export function shortName(m: CatalogModel): string {
+  return m.name.replace(/^[^:]+:\s*/, '');
+}
+
+/** One compact line for model lists: short name, id, price and what it can take in. */
+export function modelLine(m: CatalogModel): string {
+  const price = (p?: string) => {
+    const n = Number(p) * 1e6;
+    return p ? `$${Number.isInteger(n) ? n : n.toFixed(2)}` : '?';
+  };
+  const inputs = m.architecture.input_modalities.filter((x) => x !== 'text');
+  return `${shortName(m)} — ${m.id} (${price(m.pricing.prompt)}/${price(m.pricing.completion)} per M` +
+    (inputs.length ? `; ${inputs.join(', ')}` : '') + ')';
 }
