@@ -15,6 +15,8 @@ Usage: robert <command>
   setup                      Interactive setup: OpenRouter key, bot creation, owner, preferences
   start                      Run the bot (what the service runs)
   doctor                     Check the installation and explain how to fix problems
+  status                     Show how Robert runs here (service, Docker, by hand) and its version
+  update [--yes]             Pull the latest version, install dependencies and restart
   service install [--system] Run Robert in the background (systemd on Linux, launchd on macOS)
   service uninstall          Remove the background service
   service restart            Restart the background service
@@ -35,6 +37,15 @@ export async function main(argv: string[]): Promise<void> {
     case 'doctor': {
       const { runDoctor } = await import('./doctor.ts');
       process.exit((await runDoctor()) ? 0 : 1);
+    }
+    case 'status': {
+      const { runStatus } = await import('./status.ts');
+      runStatus();
+      return;
+    }
+    case 'update': {
+      const { runUpdate } = await import('./status.ts');
+      process.exit((await runUpdate({ yes: [sub, ...rest].includes('--yes') || [sub, ...rest].includes('-y') })) ? 0 : 1);
     }
     case 'service': {
       const svc = await import('./service.ts');

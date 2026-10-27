@@ -233,6 +233,16 @@ docker compose logs -f
 
 Run only one instance per bot token. Telegram delivers each update to a single poller.
 
+### Updating
+
+```sh
+npm run status   # how Robert runs here (service, Docker or by hand), from where, and which version
+npm run update   # git pull, npm ci, then restart it the way it runs
+```
+
+`npm run update` restarts services and Docker by itself. A copy started by hand has to be
+restarted by hand; the command tells you which process it is. The database upgrades itself on start.
+
 ## Privacy and security
 
 - Robert stores every message from approved chats, plus downloaded media and long-term memories,
