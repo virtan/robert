@@ -15,8 +15,9 @@ Robert: Done: reminder set for Thu 09:00.
 ## Features
 
 - **Listens, then helps when asked.** It answers when you @mention it, reply to it, or use its
-  name (any configured alias, in any language). In *smart* mode, a cheap model also catches
-  implicit requests ("can the bot check…").
+  name or a nickname (in any language). In *smart* mode, a cheap model also catches implicit
+  requests ("can the bot check…"). When addressed it always answers, and if the model fails, it
+  says so in the chat instead of going silent.
 - **Understands media.** It sees photos and stickers, transcribes voice messages, audio and video,
   and reads PDFs and text files. When the current model can't see images, a vision model
   describes them instead.
@@ -24,7 +25,9 @@ Robert: Done: reminder set for Thu 09:00.
 - **Acts.** It sets reminders (one-off, daily, weekly), takes on tasks for later ("when Igor shows
   up, suggest the change to him"), generates and edits images, and replies with voice messages.
 - **Checks its work.** For arithmetic, counting and puzzles it runs JavaScript in an isolated
-  sandbox instead of guessing (see [Privacy and security](#privacy-and-security)).
+  sandbox instead of guessing (see [Privacy and security](#privacy-and-security)). It checks chat
+  history before quoting people, and it knows the facts about itself (current model, context
+  window, limits, spending) instead of making them up.
 - **Follows the thread.** It sees edits, and each reply carries a quote of the message it answers,
   even one sent before Robert joined.
 - **Remembers.** Every message is stored in a local SQLite database. Older conversation is folded
@@ -76,14 +79,15 @@ The wizard does five things:
      paste the token. The wizard checks that privacy mode is really off.
 3. **Owner:** records your Telegram user id. Only the owner can change models and settings, and
    approve groups.
-4. **Preferences:** the names Robert answers to, your time zone, the default model and a daily
-   budget.
+4. **Preferences:** the names and nicknames Robert answers to, your time zone, the default model
+   (from the recommended list) and a daily budget.
 5. **Run:** optionally installs a background service that starts at boot and restarts on failure.
 
 Then add the bot to a group (if the wizard didn't) and say hi.
 
 Run `npm run doctor` any time to check the installation (tokens, privacy mode, model
-availability, credit).
+availability, credit), and `npm run status` to see how Robert is running. To get a newer version
+later, run `npm run update` (see [Updating](#updating)).
 
 ## Using it
 
@@ -171,8 +175,9 @@ Everything lives in the data directory, `~/.robert` by default (set `ROBERT_HOME
 |---|---|
 | `.env` | `OPENROUTER_API_KEY`, `TELEGRAM_BOT_TOKEN` (mode 600) |
 | `config.json` | Settings that differ from the defaults (see below) |
-| `robert.db` | SQLite database: messages, summaries, reminders, usage |
+| `robert.db` | SQLite database: messages, summaries, long-term memories, reminders, waiting tasks, usage |
 | `media/` | Photos, PDFs and audio received from Telegram |
+| `models-cache.json` | OpenRouter's model list, refreshed every 6 hours |
 | `system-prompt.md` | Optional: overrides [`prompts/system.md`](prompts/system.md) |
 
 Environment variables take precedence over `.env`, so you can also run Robert with
@@ -203,7 +208,8 @@ Environment variables take precedence over `.env`, so you can also run Robert wi
 }
 ```
 
-Restart after editing: `node bin/robert.ts service restart` (or restart `npm start`).
+Restart after editing: `node bin/robert.ts service restart`, or the way `npm run status` shows.
+Settings you can change from Telegram (`/model`, `/names`, `/budget`) apply right away.
 
 ## Running it
 
@@ -241,7 +247,25 @@ npm run update   # git pull, npm ci, then always restart it the way it runs
 ```
 
 `npm run update` restarts services and Docker by itself. A copy started by hand has to be
-restarted by hand; the command tells you which process it is. The database upgrades itself on start.
+restarted by hand; the command tells you which process it is. The database upgrades itself on start,
+and new default settings apply unless you changed that setting yourself.
+
+Installs from before `npm run update` existed need one manual update first:
+`git pull && npm ci`, then restart Robert (`npm run status` shows how).
+
+## Troubleshooting
+
+- **It doesn't answer when called by a nickname.** Add the nicknames people actually use:
+  `/names Robert, Rob, Роберт*, Роб`. In *direct* mode it also ignores implicit requests.
+- **It doesn't react to normal messages in a group at all.** Group privacy mode is probably on.
+  `npm run doctor` checks it. Fix it in @BotFather (`/setprivacy` → Disable), then remove the bot
+  from the group and add it back.
+- **It went quiet, or answers look odd.** Check the log (see [Running it](#running-it)): every
+  skipped message says why (not addressed, judge said no, hourly limit, daily budget, model error).
+- **It seems to run an old version, or answers twice.** `npm run status` shows every running
+  copy, where it runs from and its version. Only one copy per bot token should run.
+- **Setup's login code never arrives.** Choose the QR code login instead, or press Enter at the
+  code prompt to get the code by SMS or call.
 
 ## Privacy and security
 
@@ -296,7 +320,9 @@ npm run typecheck
 | `src/memory.ts` | Long-term memory: picking facts, the secret filter, the prompt section |
 | `src/openrouter.ts` | Minimal OpenRouter client: chat, transcription, speech, images, models |
 | `src/db.ts` | SQLite schema and queries (`node:sqlite`, full-text search with FTS5) |
-| `src/setup/` | Setup wizard and @BotFather automation (GramJS) |
+| `src/setup/` | Setup wizard, Telegram login (QR or code) and @BotFather automation (GramJS) |
+| `src/status.ts` | `status` and `update`: how Robert runs here, and updating it |
+| `src/service.ts`, `src/doctor.ts` | Service installers (systemd, launchd) and installation checks |
 | `prompts/system.md` | The system prompt template |
 
 ## License
