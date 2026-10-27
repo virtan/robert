@@ -211,7 +211,8 @@ async function claimOwner(api: BotApi, me: UserFromGetMe): Promise<number> {
 
 async function preferences(cfg: Config, me: UserFromGetMe): Promise<void> {
   say(`Besides @${me.username}, Robert answers when someone uses its name in a message.`);
-  say(dim('Separate names with commas. End a name with * to also match inflected forms (e.g. Роберт* → Роберта, Роберту).'));
+  say(dim('Separate names with commas, and include the nicknames people will actually use (Rob, Роб, Роби).'));
+  say(dim('End a name with * to also match inflected forms (e.g. Роберт* → Роберта, Роберту). Change later with /names.'));
   const names = await ask('Names', cfg.names.join(', '));
   cfg.names = names.split(',').map((n) => n.trim()).filter(Boolean);
   if (!cfg.names.length) cfg.names = [me.first_name];

@@ -60,6 +60,8 @@ export interface Config {
   retentionDays: number;
   /** 'owner': only the owner can DM Robert. 'members': anyone seen in an approved group can. */
   allowDms: 'owner' | 'members';
+  /** Lets the model run JavaScript in an isolated sandbox (QuickJS in WebAssembly) to calculate and check things. */
+  runCode: boolean;
 }
 
 export const DEFAULTS: Config = {
@@ -93,6 +95,7 @@ export const DEFAULTS: Config = {
   maxAsksPerUserPerHour: 40,
   retentionDays: 0,
   allowDms: 'owner',
+  runCode: true,
 };
 
 /** Loads HOME/.env into process.env without overriding variables that are already set (and non-empty). */

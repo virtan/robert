@@ -1,22 +1,27 @@
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy';
 import type { Chat, ChatMemberUpdated, Message } from 'grammy/types';
-import { NOREPLY, type Brain } from './brain.ts';
+import { EmptyAnswerError, NOREPLY, type Brain, type Reason } from './brain.ts';
 import type { ChatRow, MessageKind, MessageRow, NewMessage } from './db.ts';
 import { markdownToHtml, markdownToPlain, splitMarkdown } from './format.ts';
 import { log } from './log.ts';
 import {
   audioFormat, decodeText, extFromMime, isTextDocument, MAX_DOWNLOAD, removeMedia, saveMedia, toSpeechMp3, videoFrame,
 } from './media.ts';
-import { describeModel, isGeneric, modelLine, shortName } from './models.ts';
+import { describeModel, isGeneric, modelLine, shortName, switchNote } from './models.ts';
 import { OpenRouterError } from './openrouter.ts';
 import type { Outbox } from './tools.ts';
 import { isCommandForOtherBot, isDirect, nameRegex, parseCommand, realReplyTo, type Command } from './triggers.ts';
+import { snippet } from './context.ts';
 
 const JUDGE_DEBOUNCE_MS = 3000;
 const JUDGE_MAX_WAIT_MS = 10_000;
 const SUMMARY_EVERY = 40;
 const MAX_TEXT_DOC_CHARS = 60_000;
 const MAX_TRANSCRIBE_SECONDS = 30 * 60;
+/** An edit that newly addresses Robert counts as a request only if the message is this recent. */
+const EDIT_TRIGGER_WINDOW_S = 15 * 60;
+/** At most one error notice per chat in this period, for answers nobody explicitly asked for. */
+const ERROR_NOTICE_EVERY_MS = 10 * 60_000;
 
 export interface RobertDeps {
   bot: Bot;
@@ -43,6 +48,7 @@ export class Robert {
   private readonly sinceSummary = new Map<number, number>();
   /** Per chat, the newest message id that an answer already took into account. */
   private readonly answeredUpto = new Map<number, number>();
+  private readonly lastErrorNotice = new Map<number, number>();
   private timers: NodeJS.Timeout[] = [];
   private names: RegExp | null;
   private readonly judgeDebounceMs: number;
@@ -78,9 +84,7 @@ export class Robert {
     });
     bot.on('edited_message', (ctx) => {
       const m = ctx.editedMessage;
-      this.enqueue(this.ingestQ, m.chat.id, async () => {
-        this.db.updateText(m.chat.id, m.message_id, m.text ?? m.caption ?? null);
-      });
+      this.enqueue(this.ingestQ, m.chat.id, () => this.onEdit(m));
     });
     bot.on('my_chat_member', (ctx) => this.onMembership(ctx.myChatMember));
     bot.on('callback_query:data', (ctx) => this.onCallback(ctx));
@@ -170,17 +174,54 @@ export class Robert {
       return;
     }
     this.countForSummary(chat.id);
-    if (msg.from?.is_bot || isCommandForOtherBot(msg, this.me.username)) return;
+    if (msg.from?.is_bot || isCommandForOtherBot(msg, this.me.username)) {
+      log.debug(`chat ${chat.id} #${msg.message_id}: skipped (from a bot or a command for another bot)`);
+      return;
+    }
+
+    // Tasks that were waiting for this person to show up.
+    const tasks = this.db.takeWatches(chat.id, { id: row.user_id, username: row.username, name: row.user_name });
+    for (const w of tasks) {
+      log.info(`chat ${chat.id} #${msg.message_id}: waiting task #${w.id} is due`);
+      this.enqueue(this.replyQ, chat.id, () => this.answer(chat.id, row, { task: w.task, by: w.created_by_name }));
+    }
+    if (tasks.length) return;
 
     const audioText = ['voice', 'audio', 'video', 'video_note'].includes(row.kind) ? row.extracted : null;
     if (isDirect(msg, { botId: this.me.id, botUsername: this.me.username, names: this.names, extra: audioText })) {
-      if (!this.allowAsk(msg.from?.id)) {
-        await this.sendText(chat.id, 'You\'ve asked me a lot this hour; let\'s pause for a bit.', { replyTo: msg.message_id, threadId: row.thread_id, record: false });
-        return;
-      }
-      this.enqueue(this.replyQ, chat.id, () => this.answer(chat.id, row, 'direct'));
+      this.askDirect(chat.id, row);
     } else if ((chat.mode ?? this.cfg.defaultMode) === 'smart') {
       this.scheduleJudge(chat.id, row);
+    } else {
+      log.debug(`chat ${chat.id} #${msg.message_id}: not addressed (direct mode)`);
+    }
+  }
+
+  private askDirect(chatId: number, row: MessageRow): void {
+    if (!this.allowAsk(row.user_id ?? undefined)) {
+      log.info(`chat ${chatId} #${row.tg_id}: ${row.user_name} hit the hourly limit`);
+      void this.sendText(chatId, 'You\'ve asked me a lot this hour; let\'s pause for a bit.', { replyTo: row.tg_id ?? undefined, threadId: row.thread_id, record: false })
+        .catch(() => {});
+      return;
+    }
+    this.enqueue(this.replyQ, chatId, () => this.answer(chatId, row, 'direct'));
+  }
+
+  /** Stores the new text; an edit that newly addresses Robert (an added name or @mention) is answered. */
+  private async onEdit(msg: Message): Promise<void> {
+    const chat = this.db.getChat(msg.chat.id);
+    if (!chat || chat.status !== 'approved' || msg.from?.id === this.me.id) return;
+    const text = msg.text ?? msg.caption ?? null;
+    const before = this.db.editText(chat.id, msg.message_id, text, msg.edit_date ?? Math.floor(Date.now() / 1000));
+    if (!before || before.is_self || msg.from?.is_bot) return;
+    const opts = { botId: this.me.id, botUsername: this.me.username, names: this.names };
+    const nowDirect = isDirect(msg, opts);
+    const wasDirect = isDirect({ ...msg, text: before.text ?? undefined, caption: undefined, entities: [], caption_entities: [] } as Message, opts) ||
+      !!before.text?.toLowerCase().includes(`@${this.me.username.toLowerCase()}`);
+    const recent = Date.now() / 1000 - msg.date < EDIT_TRIGGER_WINDOW_S;
+    if (nowDirect && !wasDirect && recent && before.id > (this.answeredUpto.get(chat.id) ?? 0)) {
+      log.info(`chat ${chat.id} #${msg.message_id}: edited to address me`);
+      this.askDirect(chat.id, this.db.byId(before.id)!);
     }
   }
 
@@ -218,6 +259,7 @@ export class Robert {
       chat_id: chat.id,
       tg_id: msg.message_id,
       thread_id: msg.is_topic_message ? (msg.message_thread_id ?? null) : null,
+      reply_quote: replyQuote(msg, this.db.getMessage(chat.id, realReplyTo(msg)?.message_id ?? 0)),
       user_id: from?.id ?? null,
       user_name: sender && sender.id !== chat.id ? chatTitle(sender) : [from?.first_name, from?.last_name].filter(Boolean).join(' ') || null,
       username: sender && 'username' in sender ? (sender.username ?? null) : (from?.username ?? null),
@@ -383,25 +425,37 @@ export class Robert {
     if (!chat || chat.status !== 'approved' || (chat.mode ?? this.cfg.defaultMode) !== 'smart' || this.brain.overBudget()) return;
     // Messages an answer already saw don't need judging; ones that arrived while Robert was typing do.
     const candidates = pending.filter((p) => p.id > (this.answeredUpto.get(chatId) ?? 0));
-    if (!candidates.length) return;
+    if (!candidates.length) {
+      log.debug(`chat ${chatId}: ${pending.length} message(s) already covered by an answer`);
+      return;
+    }
     let target: MessageRow | null = null;
     try {
       target = await this.brain.judge(chat, candidates);
     } catch (err) {
-      log.warn('judge failed:', (err as Error).message);
+      log.warn(`chat ${chatId}: judge failed, so ${candidates.length} message(s) went unanswered:`, (err as Error).message);
+      return;
     }
-    if (target && this.allowAsk(target.user_id ?? undefined)) {
-      log.info(`chat ${chatId}: judge picked #${target.tg_id}`);
-      await this.answer(chatId, target, 'judge');
+    const ids = candidates.map((c) => `#${c.tg_id}`).join(', ');
+    if (!target) {
+      log.debug(`chat ${chatId}: judge found no request in ${ids}`);
+      return;
     }
+    if (!this.allowAsk(target.user_id ?? undefined)) {
+      log.info(`chat ${chatId}: judge picked #${target.tg_id}, but ${target.user_name} hit the hourly limit`);
+      return;
+    }
+    log.info(`chat ${chatId}: judge picked #${target.tg_id}`);
+    await this.answer(chatId, target, 'judge');
   }
 
-  private async answer(chatId: number, trigger: MessageRow, reason: 'direct' | 'judge'): Promise<void> {
+  private async answer(chatId: number, trigger: MessageRow, reason: Reason): Promise<void> {
     const chat = this.db.getChat(chatId);
     if (!chat || chat.status !== 'approved') return;
     const reply = { replyTo: trigger.tg_id ?? undefined, threadId: trigger.thread_id };
     if (this.brain.overBudget()) {
-      if (reason === 'direct' && this.notice(`budget:${chatId}:${new Date().toISOString().slice(0, 10)}`)) {
+      log.info(`chat ${chatId} #${trigger.tg_id}: not answered, daily budget reached`);
+      if (reason !== 'judge' && this.notice(`budget:${chatId}:${new Date().toISOString().slice(0, 10)}`)) {
         await this.sendText(chatId, `I've reached today's spending limit ($${this.cfg.dailyBudgetUsd}). I'll be back tomorrow (UTC), or the owner can raise it with /budget.`, { ...reply, record: false });
       }
       return;
@@ -411,9 +465,15 @@ export class Robert {
     try {
       const text = await this.brain.respond(chat, trigger, reason, this.outbox);
       if (text && text !== NOREPLY) await this.sendText(chatId, text, reply);
+      else log.info(`chat ${chatId} #${trigger.tg_id}: the model chose not to reply (NOREPLY)`);
     } catch (err) {
-      log.error(`answer in ${chatId} failed:`, err);
-      if (reason === 'direct') await this.sendText(chatId, friendlyError(err), { ...reply, record: false });
+      log.error(`answer in ${chatId} to #${trigger.tg_id} failed:`, err);
+      // Always say so when asked directly; otherwise at most once in a while, so a failing model can't spam.
+      const last = this.lastErrorNotice.get(chatId) ?? 0;
+      if (reason === 'direct' || Date.now() - last > ERROR_NOTICE_EVERY_MS) {
+        this.lastErrorNotice.set(chatId, Date.now());
+        await this.sendText(chatId, friendlyError(err), { ...reply, record: false }).catch(() => {});
+      }
     } finally {
       stopTyping();
     }
@@ -565,7 +625,9 @@ export class Robert {
     } else if (kind === 'md' && ctx.chat) {
       const model = arg === 'default' ? null : this.cfg.modelPresets[Number(arg)];
       this.db.setChatModel(ctx.chat.id, model ?? null);
-      await ctx.editMessageText(`Model for this chat: ${model ?? `default (${this.cfg.models.chat})`}`).catch(() => {});
+      const id = model ?? this.cfg.models.chat;
+      await ctx.editMessageText(`Model for this chat: ${model ?? `default (${id})`}\n\n${switchNote(this.brain.catalog.get(id), this.cfg.historyTokens)}`)
+        .catch(() => {});
     }
     await ctx.answerCallbackQuery().catch(() => {});
   }
@@ -626,7 +688,7 @@ export class Robert {
         }
         const others = candidates.slice(1, 4).map((m) => `\`${m.id}\``).join(', ');
         await reply(`${global ? 'Default model' : 'Model for this chat'}: ${describeModel(match, match.id)}` +
-          (others ? `\nOther matches: ${others}` : ''));
+          (others ? `\nOther matches: ${others}` : '') + `\n\n${switchNote(match, this.cfg.historyTokens)}`);
         break;
       }
       case 'models': {
@@ -638,6 +700,18 @@ export class Robert {
           ? (generic ? 'Well-known models (search others with /models <words>):\n' : '') +
             list.map((m) => `${m.id === current ? '▸' : '•'} ${modelLine(m)}`).join('\n')
           : 'No models match.');
+        break;
+      }
+      case 'names': {
+        if (!cmd.args) {
+          await reply(`I answer to: ${this.cfg.names.join(', ')} (and @${this.me.username}). Change with /names Robert, Rob, Роберт*, Роб — a trailing * also matches inflected forms.`);
+          break;
+        }
+        const names = cmd.args.split(/[,;\n]+/).map((n) => n.trim()).filter(Boolean).slice(0, 20);
+        this.cfg.names = names;
+        this.names = nameRegex(names);
+        this.brain.persistConfig();
+        await reply(`I'll answer to: ${names.join(', ')}.`);
         break;
       }
       case 'mode': {
@@ -740,6 +814,7 @@ const COMMANDS: Record<string, { owner?: boolean; menu?: string }> = {
   model: { menu: 'Show or change the AI model' },
   models: { menu: 'Search available models' },
   mode: { owner: true, menu: 'When I join the conversation' },
+  names: { owner: true },
   status: { menu: 'Model, spending and memory' },
   summary: { menu: 'What I remember from earlier' },
   forget: { owner: true, menu: 'Erase this chat from my memory' },
@@ -758,7 +833,7 @@ function helpText(name: string, username: string, owner: boolean): string {
     '/status — model, spending and memory',
     '/summary — what I remember from earlier',
     ...(owner
-      ? ['', 'Owner only:', '/model <name> — use another model here (/model global <name> for all chats)', '/mode smart|direct — whether I also answer implicit requests', '/budget <usd> — daily spending limit', '/forget — erase this chat from my memory', '/leave — remove me from this group']
+      ? ['', 'Owner only:', '/model <name> — use another model here (/model global <name> for all chats)', '/mode smart|direct — whether I also answer implicit requests', '/names <list> — names and nicknames I answer to', '/budget <usd> — daily spending limit', '/forget — erase this chat from my memory', '/leave — remove me from this group']
       : []),
     '',
     'Everything said here is stored on my server so I can remember context.',
@@ -766,6 +841,7 @@ function helpText(name: string, username: string, owner: boolean): string {
 }
 
 function friendlyError(err: unknown): string {
+  if (err instanceof EmptyAnswerError) return '⚠️ The model returned an empty answer twice. Please ask again, or the owner can try another model with /model.';
   if (err instanceof OpenRouterError) {
     if (err.status === 402) return '⚠️ The OpenRouter account is out of credits.';
     if (err.status === 404) return `⚠️ The model isn't available (${err.message}). The owner can switch with /model.`;
@@ -774,6 +850,18 @@ function friendlyError(err: unknown): string {
   }
   if ((err as Error)?.name === 'TimeoutError') return '⚠️ That took too long. Please try again.';
   return '⚠️ Something went wrong on my side. Please try again in a minute.';
+}
+
+/**
+ * What the sender quoted (Telegram lets people reply to a selected part), or, when Robert doesn't
+ * have the replied-to message stored (e.g. it predates Robert), the start of its text.
+ */
+function replyQuote(msg: Message, stored: MessageRow | undefined): string | null {
+  if (msg.quote?.text) return msg.quote.text.slice(0, 500);
+  const r = realReplyTo(msg);
+  if (!r || stored) return null;
+  const text = r.text ?? r.caption ?? null;
+  return text ? snippet(text, 300) : null;
 }
 
 function hasContent(m: Message): boolean {

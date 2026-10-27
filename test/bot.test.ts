@@ -61,7 +61,7 @@ describe('answering', () => {
     assert.ok(allText(req).includes('We land in Lisbon on Friday'), 'earlier message is in context');
     assert.match(String(req.messages[0].content), /You're Robert/);
     assert.ok(req.tools?.some((t) => t.type === 'openrouter:web_search'));
-    assert.match(JSON.stringify(lastUserParts(req)), new RegExp(`Answer message #${ask.message_id}`));
+    assert.match(JSON.stringify(lastUserParts(req)), new RegExp(`addressed you directly in message #${ask.message_id}`));
 
     const reply = h.sent().at(-1)!;
     assert.equal(reply.payload.text, 'Lisbon on <b>Friday</b> — have fun!');
@@ -272,7 +272,7 @@ describe('memory', () => {
     h.db.insertMessage({ chat_id: GROUP.id, tg_id: 2, thread_id: null, user_id: 3, user_name: 'Bob', username: 'bob', date: 1, reply_to: null, forwarded_from: null, kind: 'voice', text: null, extracted: 'Мы прилетаем в субботу', media_path: null, media_mime: null, media_name: null, duration: 3 });
     assert.equal(h.db.search(GROUP.id, 'flight', 5)[0].tg_id, 1);
     assert.equal(h.db.search(GROUP.id, 'прилетаем', 5)[0].tg_id, 2);
-    assert.equal(h.db.search(GROUP.id, '', 5, '@bob')[0].tg_id, 2);
-    assert.equal(h.db.search(GROUP.id, 'flight', 5, 'bob').length, 0);
+    assert.equal(h.db.search(GROUP.id, '', 5, { from: '@bob' })[0].tg_id, 2);
+    assert.equal(h.db.search(GROUP.id, 'flight', 5, { from: 'bob' }).length, 0);
   });
 });

@@ -4,7 +4,8 @@ import { body, displayName, isImage, localTime } from './context.ts';
 import type { ChatRow, MessageRow } from './db.ts';
 import { log } from './log.ts';
 import { dataUrl, extFromMime, saveMedia, toVoiceOgg } from './media.ts';
-import { describeModel, isGeneric, modelLine } from './models.ts';
+import { describeModel, isGeneric, modelLine, switchNote } from './models.ts';
+import { runJs } from './sandbox/run.ts';
 import type { CatalogModel, Tool } from './openrouter.ts';
 import { parseWhen } from './time.ts';
 
@@ -26,13 +27,15 @@ const fn = (name: string, description: string, properties: Record<string, unknow
   function: { name, description, parameters: { type: 'object', properties, required, additionalProperties: false } },
 });
 
-export function toolDefinitions(): Tool[] {
+export function toolDefinitions(opts: { runCode: boolean }): Tool[] {
   return [
     { type: 'openrouter:web_search', parameters: { max_results: 5 } },
     { type: 'openrouter:web_fetch', parameters: { max_content_tokens: 12000 } },
-    fn('search_history', 'Search older messages in this chat (beyond what you can see). Returns matching messages with ids.', {
-      query: { type: 'string', description: 'Words to look for. May be empty when filtering by sender only.' },
+    fn('search_history', 'Search all stored messages in this chat. Returns full messages with sender, date and time. ' +
+      'Words match by prefix; queries with emoji or symbols match exactly. Use order "oldest" for questions like "the first time…".', {
+      query: { type: 'string', description: 'Words, an emoji or an exact phrase. May be empty when filtering by sender only.' },
       from: { type: 'string', description: 'Optional sender name or @username to filter by.' },
+      order: { type: 'string', enum: ['relevance', 'oldest', 'newest'], description: 'Default: relevance.' },
       limit: { type: 'integer', minimum: 1, maximum: 30 },
     }, ['query']),
     fn('look_at', 'Examine the image, video frame or PDF attached to a message in this chat, and answer a question about it.', {
@@ -44,8 +47,17 @@ export function toolDefinitions(): Tool[] {
       text: { type: 'string', description: 'What to remind about, phrased to be read at that time.' },
       repeat: { type: 'string', enum: ['none', 'daily', 'weekly'] },
     }, ['when', 'text']),
-    fn('list_reminders', 'List upcoming reminders in this chat.', {}),
-    fn('cancel_reminder', 'Cancel a reminder in this chat by id.', { id: { type: 'integer' } }, ['id']),
+    fn('watch_for_message', 'Do something when a given person next writes in this chat, e.g. "when Igor shows up, ' +
+      'suggest the change to him". You will be woken by their next message and given the task.', {
+      person: { type: 'string', description: 'Their @username or name as it appears in the chat.' },
+      task: { type: 'string', description: 'What to do then, written as an instruction to yourself, with all needed context.' },
+      days: { type: 'integer', minimum: 1, maximum: 90, description: 'Give up after this many days (default 30).' },
+    }, ['person', 'task']),
+    fn('list_reminders', 'List upcoming reminders and waiting tasks (watch_for_message) in this chat.', {}),
+    fn('cancel_reminder', 'Cancel a reminder or a waiting task in this chat.', {
+      id: { type: 'integer' },
+      kind: { type: 'string', enum: ['reminder', 'watch'], description: 'Default: reminder.' },
+    }, ['id']),
     fn('generate_image', 'Create an image (or edit images from the chat) and send it to the chat.', {
       prompt: { type: 'string', description: 'Detailed description of the image to create, in English.' },
       aspect_ratio: { type: 'string', enum: ['1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3'] },
@@ -55,6 +67,11 @@ export function toolDefinitions(): Tool[] {
       text: { type: 'string', description: 'Exactly what to say. Plain spoken language, no Markdown.' },
       style: { type: 'string', description: 'Optional delivery instructions, e.g. "cheerful", "slowly".' },
     }, ['text']),
+    ...(opts.runCode ? [fn('run_js', 'Run JavaScript in an isolated sandbox and get its output: for arithmetic, counting, ' +
+      'dates, puzzles and brute-force checks. Synchronous ES2023 with BigInt; no network, files, timers or modules. ' +
+      'Print with console.log; the value of the last expression is returned too. Limits: 5 s, 64 MB.', {
+      code: { type: 'string' },
+    }, ['code'])] : []),
     fn('find_models', 'List AI models Robert can use. Without a query, returns a short list of well-known current models: ' +
       'show it as a compact list of the short names (e.g. "Claude Opus 5.5", "Grok 4.7"), not ids or routers. ' +
       'With a query such as "opus" or "gemini flash", searches the whole OpenRouter catalog.', {
@@ -67,10 +84,15 @@ export function toolDefinitions(): Tool[] {
   ];
 }
 
-export const TOOLS_HELP = `- Web search and web page fetching for anything current or outside your knowledge.
-- search_history: search this chat's older messages.
+export function toolsHelp(opts: { runCode: boolean }): string {
+  return TOOLS_HELP + (opts.runCode ? '\n- run_js: run JavaScript in a sandbox to calculate, count or brute-force; trust its output over mental math.' : '');
+}
+
+const TOOLS_HELP = `- Web search and web page fetching for anything current or outside your knowledge.
+- search_history: search everything stored from this chat, by words, emoji or sender.
 - look_at: examine an image, video frame or PDF from any message in this chat.
 - create_reminder / list_reminders / cancel_reminder: scheduled messages to this chat.
+- watch_for_message: act when a given person next writes here (the only way to do something "when X shows up").
 - generate_image: create or edit images; the image is sent to the chat directly.
 - send_voice: answer with a voice message. If you used it, reply NOREPLY unless you have something to add in text.
 - find_models / switch_model: look up and change the AI model (switching is owner-only).`;
@@ -90,7 +112,12 @@ export async function runTool(name: string, rawArgs: string, env: ToolEnv): Prom
       case 'create_reminder': return createReminder(env, args);
       case 'list_reminders': return listReminders(env);
       case 'cancel_reminder':
+        if (args.kind === 'watch') return env.brain.db.cancelWatch(env.chat.id, Number(args.id)) ? 'Cancelled.' : 'No such waiting task in this chat.';
         return env.brain.db.cancelReminder(env.chat.id, Number(args.id)) ? 'Cancelled.' : 'No such active reminder in this chat.';
+      case 'watch_for_message': return watchForMessage(env, args);
+      case 'run_js':
+        if (!env.brain.config.runCode) return 'Error: code execution is disabled.';
+        return await runJs(String(args.code ?? ''));
       case 'generate_image': return await generateImage(env, args);
       case 'send_voice': return await sendVoice(env, args);
       case 'find_models': return await findModels(env, args);
@@ -105,13 +132,39 @@ export async function runTool(name: string, rawArgs: string, env: ToolEnv): Prom
 
 function searchHistory(env: ToolEnv, a: Record<string, unknown>): string {
   const limit = Math.min(Number(a.limit) || 10, 30);
-  const rows = env.brain.db.search(env.chat.id, String(a.query ?? ''), limit, a.from ? String(a.from) : undefined);
-  if (!rows.length) return 'No matching messages.';
+  const order = (['oldest', 'newest'].includes(String(a.order)) ? a.order : 'relevance') as 'relevance' | 'oldest' | 'newest';
+  const rows = env.brain.db.search(env.chat.id, String(a.query ?? ''), limit, { from: a.from ? String(a.from) : undefined, order });
+  if (!rows.length) return 'No matching messages. Don\'t claim anything about them.';
   const tz = env.brain.config.timezone;
-  return rows
-    .sort((x, y) => x.id - y.id)
-    .map((m) => `#${m.tg_id} ${localTime(m.date, tz, true)} ${m.is_self ? 'you' : displayName(m)}: ${body(m).slice(0, 600)}`)
-    .join('\n');
+  if (order === 'relevance') rows.sort((x, y) => x.id - y.id);
+  return `${rows.length} message(s), ${order === 'relevance' ? 'in chronological order' : `${order} first`}:\n\n` + rows
+    .map((m) => {
+      const edited = m.edited_at ? ` (edited ${localTime(m.edited_at, tz, true)})` : '';
+      return `#${m.tg_id} ${localTime(m.date, tz, true)}${edited} ${m.is_self ? 'you' : displayName(m)}:\n${body(m).slice(0, 2000)}`;
+    })
+    .join('\n\n');
+}
+
+function watchForMessage(env: ToolEnv, a: Record<string, unknown>): string {
+  const { brain, chat, trigger } = env;
+  const person = String(a.person ?? '').trim();
+  const task = String(a.task ?? '').trim().slice(0, 2000);
+  if (!person || !task) return 'Error: both person and task are needed.';
+  const member = brain.db.findMember(chat.id, person);
+  const days = Math.min(Math.max(Number(a.days) || 30, 1), 90);
+  const id = brain.db.addWatch({
+    chat_id: chat.id,
+    thread_id: trigger.thread_id,
+    created_by: trigger.user_id,
+    created_by_name: trigger.user_name,
+    user_id: member?.user_id ?? null,
+    user_key: (member?.username ?? person.replace(/^@/, '')).toLowerCase(),
+    task,
+    expires_at: Math.floor(Date.now() / 1000) + days * 86_400,
+  });
+  const who = member ? displayName(member) : person;
+  return `Waiting task #${id} saved: when ${who} next writes here (within ${days} days), you'll be asked to: ${task}` +
+    (member ? '' : `\nNote: nobody called "${person}" has written here yet; it will match their @username or name.`);
 }
 
 async function lookAt(env: ToolEnv, a: Record<string, unknown>): Promise<string> {
@@ -141,11 +194,11 @@ function createReminder(env: ToolEnv, a: Record<string, unknown>): string {
 
 function listReminders(env: ToolEnv): string {
   const tz = env.brain.config.timezone;
-  const list = env.brain.db.listReminders(env.chat.id);
-  if (!list.length) return 'No upcoming reminders.';
-  return list
-    .map((r) => `#${r.id} ${localTime(r.due_at, tz, true)}${r.repeat !== 'none' ? ` (${r.repeat})` : ''}: ${r.text}`)
-    .join('\n');
+  const reminders = env.brain.db.listReminders(env.chat.id)
+    .map((r) => `reminder #${r.id} ${localTime(r.due_at, tz, true)}${r.repeat !== 'none' ? ` (${r.repeat})` : ''}: ${r.text}`);
+  const watches = env.brain.db.listWatches(env.chat.id)
+    .map((w) => `watch #${w.id} when ${w.user_key} writes (until ${localTime(w.expires_at, tz, true)}): ${w.task}`);
+  return [...reminders, ...watches].join('\n') || 'No upcoming reminders or waiting tasks.';
 }
 
 async function generateImage(env: ToolEnv, a: Record<string, unknown>): Promise<string> {
@@ -227,5 +280,6 @@ async function switchModel(env: ToolEnv, a: Record<string, unknown>): Promise<st
   }
   const others = candidates.slice(1, 4).map((m) => m.id).join(', ');
   return `Switched ${global ? 'the default model for all chats' : 'this chat'} to ${describeModel(match, match.id)}.` +
-    (others ? ` Other matches were: ${others}.` : '') + ' The change applies from the next message.';
+    (others ? ` Other matches were: ${others}.` : '') + ' The change applies from the next message.\n' +
+    switchNote(match, brain.config.historyTokens) + '\nTell the user this briefly.';
 }

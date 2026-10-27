@@ -196,3 +196,24 @@ export function modelLine(m: CatalogModel): string {
   return `${shortName(m)} — ${m.id} (${price(m.pricing.prompt)}/${price(m.pricing.completion)} per M` +
     (inputs.length ? `; ${inputs.join(', ')}` : '') + ')';
 }
+
+/** Context budget for recent messages: the configured size, shrunk to fit small context windows. */
+export function historyBudget(m: CatalogModel | undefined, historyTokens: number): number {
+  return m?.context_length ? Math.max(2000, Math.min(historyTokens, Math.floor(m.context_length * 0.5) - 2000)) : historyTokens;
+}
+
+/** What changes for the conversation when switching to this model, for the people in the chat. */
+export function switchNote(m: CatalogModel | undefined, historyTokens: number): string {
+  const lines: string[] = [];
+  const k = (t: number) => (t >= 1000 ? `${Math.round(t / 1000)}k` : String(t));
+  const budget = historyBudget(m, historyTokens);
+  if (m?.context_length) lines.push(`Context window: ${k(m.context_length)} tokens.`);
+  lines.push(budget < historyTokens
+    ? `Its context is small, so it sees only the last ~${k(budget)} tokens of chat (instead of ~${k(historyTokens)}) plus the summary of older messages; nothing is deleted.`
+    : `Memory carries over: every model gets the last ~${k(historyTokens)} tokens of chat plus the summary of older messages, and can search the full history.`);
+  if (m && !m.supported_parameters?.includes('tools')) lines.push('⚠️ This model can\'t use tools: no web search, reminders, images or voice.');
+  if (m && (m.id.startsWith('openrouter/') || m.id.endsWith(':free') || Number(m.pricing.completion) === 0)) {
+    lines.push('⚠️ Free models and routers are rate-limited and noticeably less accurate, especially with tools.');
+  }
+  return lines.join('\n');
+}

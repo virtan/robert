@@ -3,6 +3,7 @@ import { paths, REPO_ROOT, type Config } from './config.ts';
 import type { ChatRow, DB, MessageRow } from './db.ts';
 import { dataUrl } from './media.ts';
 import type { ChatMessage, ContentPart } from './openrouter.ts';
+import type { Reason } from './brain.ts';
 import path from 'node:path';
 
 /** Rough token estimate; errs high for non-Latin scripts, which tokenize less efficiently. */
@@ -21,11 +22,34 @@ export function displayName(m: Pick<MessageRow, 'user_name' | 'username'>): stri
   return m.username && m.user_name ? `${name} (@${m.username})` : name;
 }
 
-export function header(m: MessageRow, tz: string, prevDate?: number): string {
+/**
+ * `[#123 Anna (@anna) 14:05, edited 14:07 ↩ #120 Boris: "the start of it…"]`. The reply part quotes
+ * the replied-to message, so a reply makes sense even when that message is out of view.
+ */
+export function header(m: MessageRow, tz: string, prevDate?: number, db?: DB, self = 'you'): string {
   // Show the date only when the day changes, to keep headers short.
   const newDay = !prevDate || localTime(prevDate, tz, true).slice(0, 10) !== localTime(m.date, tz, true).slice(0, 10);
   const when = localTime(m.date, tz, newDay);
-  return `[#${m.tg_id} ${displayName(m)} ${when}${m.reply_to ? ` ↩#${m.reply_to}` : ''}]`;
+  const edited = m.edited_at ? `, edited ${localTime(m.edited_at, tz)}` : '';
+  return `[#${m.tg_id} ${displayName(m)} ${when}${edited}${m.reply_to ? ` ↩ ${replyNote(m, db, self)}` : ''}]`;
+}
+
+const QUOTE_CHARS = 120;
+
+export function snippet(text: string, max = QUOTE_CHARS): string {
+  const flat = text.replace(/\s+/g, ' ').trim();
+  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+}
+
+function replyNote(m: MessageRow, db: DB | undefined, self: string): string {
+  const target = db?.getMessage(m.chat_id, m.reply_to!);
+  if (target) {
+    const who = target.is_self ? self : target.user_name || target.username || 'someone';
+    // Telegram's quote is the part the sender selected, so it beats the start of the message.
+    const text = m.reply_quote || body(target);
+    return `#${m.reply_to} ${who}: "${snippet(text)}"`;
+  }
+  return m.reply_quote ? `#${m.reply_to}: "${snippet(m.reply_quote)}"` : `#${m.reply_to}`;
 }
 
 const KIND_LABEL: Record<string, string> = {
@@ -65,8 +89,10 @@ export interface ContextInput {
   chat: ChatRow;
   model: string;
   trigger: MessageRow;
-  /** 'direct': Robert was addressed; 'judge': the judge thinks Robert was implicitly asked. */
-  reason: 'direct' | 'judge';
+  /** 'direct': Robert was addressed; 'judge': the judge thinks Robert was implicitly asked; or a waiting task. */
+  reason: Reason;
+  /** Token budget for recent messages (already fitted to the model's context window). */
+  historyTokens: number;
   canSee: boolean;
   canReadFiles: boolean;
   /** Describes an image for models that can't see; returns null on failure. */
@@ -89,7 +115,7 @@ export async function buildContext(input: ContextInput): Promise<Context> {
   for (const m of db.recent(chat.id, chat.summary_upto, 500)) {
     if (m.id > trigger.id) continue;
     const t = estimateTokens(body(m)) + 20 + (isImage(m) ? IMAGE_TOKENS : 0);
-    if (rows.length && tokens + t > config.historyTokens) break;
+    if (rows.length && tokens + t > input.historyTokens) break;
     tokens += t;
     rows.push(m);
   }
@@ -119,7 +145,7 @@ export async function buildContext(input: ContextInput): Promise<Context> {
       if (repliedOutside && m.id === replied!.id) {
         parts.push({ type: 'text', text: '(an earlier message, quoted because the current one replies to it:)' });
       }
-      parts.push({ type: 'text', text: `${header(m, tz, prevDate)}\n${body(m)}`.trim() });
+      parts.push({ type: 'text', text: `${header(m, tz, prevDate, db)}\n${body(m)}`.trim() });
       if (attach.has(m.id)) parts.push(...(await mediaParts(m, input)));
       else if (isImage(m)) parts.push({ type: 'text', text: m.description ? `(image: ${m.description})` : '(image not shown; use look_at to examine it)' });
       else if (isPdf(m)) parts.push({ type: 'text', text: '(PDF not attached; use look_at to read it)' });
@@ -133,11 +159,15 @@ export async function buildContext(input: ContextInput): Promise<Context> {
   }
 
   const who = displayName(trigger);
+  const r = input.reason;
   const note =
-    input.reason === 'direct'
-      ? `(Answer message #${trigger.tg_id} from ${who}.)`
-      : `(Nobody addressed you by name, but message #${trigger.tg_id} from ${who} seems to be asking you. ` +
-        'Answer it if so; otherwise reply NOREPLY.)';
+    r === 'direct'
+      ? `(${who} addressed you directly in message #${trigger.tg_id}: answer it.)`
+      : r === 'judge'
+        ? `(Nobody addressed you by name, but message #${trigger.tg_id} from ${who} seems to be asking you. ` +
+          'Answer it if so; otherwise reply NOREPLY.)'
+        : `(${who} just wrote message #${trigger.tg_id}. Earlier, ${r.by ?? 'someone'} asked you to do this when ` +
+          `${who} showed up: "${r.task}". Do it now, addressing ${who}. If their message also asks you something, answer that too.)`;
   const lastSeg = segments.at(-1);
   if (lastSeg?.role === 'user') lastSeg.parts.push({ type: 'text', text: note });
   else segments.push({ role: 'user', parts: [{ type: 'text', text: note }] });
@@ -196,7 +226,7 @@ export function loadTemplate(): string {
 
 export function renderSystem(
   template: string,
-  v: { config: Config; chat: ChatRow; model: string; tools: string; ownerName: string },
+  v: { config: Config; chat: ChatRow; model: string; tools: string; ownerName: string; about?: string },
 ): string {
   const { config, chat } = v;
   const aliases = config.names.length > 1 ? `People may also call you ${config.names.slice(1).join(', ')}.` : '';
@@ -212,6 +242,7 @@ export function renderSystem(
     chat: chatDesc,
     model: v.model,
     tools: v.tools,
+    about: v.about ?? '',
     owner: v.ownerName,
     summary,
   };

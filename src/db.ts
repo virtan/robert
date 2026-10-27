@@ -45,10 +45,29 @@ export interface MessageRow {
   media_mime: string | null;
   media_name: string | null;
   duration: number | null;
+  /** When the sender last edited it (unix seconds). */
+  edited_at: number | null;
+  /** What Telegram showed of the replied-to message: the selected quote, or the start of its text. */
+  reply_quote: string | null;
 }
 
-export type NewMessage = Omit<MessageRow, 'id' | 'extracted' | 'description' | 'is_self'> &
-  Partial<Pick<MessageRow, 'extracted' | 'description' | 'is_self'>>;
+export type NewMessage = Omit<MessageRow, 'id' | 'extracted' | 'description' | 'is_self' | 'edited_at' | 'reply_quote'> &
+  Partial<Pick<MessageRow, 'extracted' | 'description' | 'is_self' | 'reply_quote'>>;
+
+/** A task to carry out when someone next writes in the chat. */
+export interface WatchRow {
+  id: number;
+  chat_id: number;
+  thread_id: number | null;
+  created_by: number | null;
+  created_by_name: string | null;
+  /** Telegram user id of the person to wait for, when known. */
+  user_id: number | null;
+  /** Lowercased @username or display name of the person, as a fallback. */
+  user_key: string;
+  task: string;
+  expires_at: number;
+}
 
 export interface ReminderRow {
   id: number;
@@ -122,7 +141,26 @@ CREATE TABLE IF NOT EXISTS usage (
   completion_tokens INTEGER
 );
 CREATE INDEX IF NOT EXISTS usage_ts ON usage(ts);
+CREATE TABLE IF NOT EXISTS watches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id INTEGER NOT NULL,
+  thread_id INTEGER,
+  created_by INTEGER,
+  created_by_name TEXT,
+  user_id INTEGER,
+  user_key TEXT NOT NULL,
+  task TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  done INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS watches_chat ON watches(chat_id, done);
 `;
+
+/** Columns added after the first release; created on old databases at startup. */
+const ADDED_COLUMNS: [table: string, column: string, type: string][] = [
+  ['messages', 'edited_at', 'INTEGER'],
+  ['messages', 'reply_quote', 'TEXT'],
+];
 
 const n = (v: unknown): SQLInputValue => (v === undefined ? null : (v as SQLInputValue));
 
@@ -134,6 +172,10 @@ export class DB {
     this.sql = new DatabaseSync(file);
     this.sql.exec('PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;');
     this.sql.exec(SCHEMA);
+    for (const [table, column, type] of ADDED_COLUMNS) {
+      const cols = this.sql.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+      if (!cols.some((c) => c.name === column)) this.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+    }
     if (file !== ':memory:') fs.chmodSync(file, 0o600);
   }
 
@@ -188,6 +230,7 @@ export class DB {
       this.sql.prepare("UPDATE chats SET id = ?, type = 'supergroup' WHERE id = ?").run(to, from);
       this.sql.prepare('UPDATE messages SET chat_id = ? WHERE chat_id = ?').run(to, from);
       this.sql.prepare('UPDATE reminders SET chat_id = ? WHERE chat_id = ?').run(to, from);
+      this.sql.prepare('UPDATE watches SET chat_id = ? WHERE chat_id = ?').run(to, from);
       this.sql.exec('COMMIT');
     } catch (err) {
       this.sql.exec('ROLLBACK');
@@ -201,19 +244,28 @@ export class DB {
     const r = this.sql
       .prepare(
         `INSERT INTO messages (chat_id, tg_id, thread_id, user_id, user_name, username, is_self, date, reply_to,
-           forwarded_from, kind, text, extracted, description, media_path, media_mime, media_name, duration)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           forwarded_from, kind, text, extracted, description, media_path, media_mime, media_name, duration, reply_quote)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(chat_id, tg_id) WHERE tg_id IS NOT NULL DO NOTHING`,
       )
       .run(
         m.chat_id, n(m.tg_id), n(m.thread_id), n(m.user_id), n(m.user_name), n(m.username), m.is_self ?? 0, m.date,
         n(m.reply_to), n(m.forwarded_from), m.kind, n(m.text), n(m.extracted), n(m.description), n(m.media_path),
-        n(m.media_mime), n(m.media_name), n(m.duration),
+        n(m.media_mime), n(m.media_name), n(m.duration), n(m.reply_quote),
       );
     if (r.changes === 0) return this.getMessage(m.chat_id, m.tg_id!)!.id;
     const id = Number(r.lastInsertRowid);
     this.reindex(id);
     return id;
+  }
+
+  /** Applies an edit. Returns the message before the edit, or undefined if it isn't stored. */
+  editText(chatId: number, tgId: number, text: string | null, editedAt: number): MessageRow | undefined {
+    const before = this.getMessage(chatId, tgId);
+    if (!before) return undefined;
+    this.sql.prepare('UPDATE messages SET text = ?, edited_at = ? WHERE id = ?').run(text, editedAt, before.id);
+    this.reindex(before.id);
+    return before;
   }
 
   updateText(chatId: number, tgId: number, text: string | null): MessageRow | undefined {
@@ -263,28 +315,86 @@ export class DB {
       .all(chatId, afterId, uptoId) as unknown as MessageRow[];
   }
 
-  search(chatId: number, query: string, limit: number, fromUser?: string): MessageRow[] {
-    const words = query.match(/[\p{L}\p{N}]+/gu)?.slice(0, 12) ?? [];
-    const who = fromUser?.replace(/^@/, '').toLowerCase();
+  /**
+   * Finds messages by words (full-text, prefix match) or, for queries with emoji or other symbols,
+   * by exact substring. `order` picks the best matches ('relevance'), or the oldest/newest ones.
+   */
+  search(
+    chatId: number, query: string, limit: number,
+    opts: { from?: string; order?: 'relevance' | 'oldest' | 'newest' } = {},
+  ): MessageRow[] {
+    const order = opts.order ?? 'relevance';
+    const who = opts.from?.replace(/^@/, '').toLowerCase();
     const filter = (rows: MessageRow[]) =>
-      who
-        ? rows.filter((r) => r.username?.toLowerCase() === who || r.user_name?.toLowerCase().includes(who))
-        : rows;
-    if (!words.length) {
-      if (!who) return [];
-      return filter(this.recent(chatId, 0, 2000)).slice(0, limit);
+      who ? rows.filter((r) => r.username?.toLowerCase() === who || r.user_name?.toLowerCase().includes(who)) : rows;
+    const q = query.trim();
+    const words = q.match(/[\p{L}\p{N}]+/gu)?.slice(0, 12) ?? [];
+    const byId = order === 'oldest' ? 'm.id ASC' : 'm.id DESC';
+    const fetch = who ? 5000 : limit;
+
+    if (!q) return who ? filter(this.recent(chatId, 0, 5000)).sort(sortBy(order)).slice(0, limit) : [];
+
+    // The full-text index drops emoji and punctuation, so search those as plain substrings.
+    if (/[^\p{L}\p{N}\s"'.,!?;:()\-]/u.test(q) || !words.length) {
+      const rows = this.sql
+        .prepare(
+          `SELECT m.* FROM messages m WHERE m.chat_id = ? AND (instr(m.text, ?) > 0 OR instr(m.extracted, ?) > 0)
+           ORDER BY ${byId} LIMIT ?`,
+        )
+        .all(chatId, q, q, fetch) as unknown as MessageRow[];
+      return filter(rows).slice(0, limit);
     }
     const run = (match: string) =>
       this.sql
         .prepare(
           `SELECT m.* FROM messages_fts f JOIN messages m ON m.id = f.rowid
-           WHERE messages_fts MATCH ? AND m.chat_id = ? ORDER BY bm25(messages_fts) LIMIT ?`,
+           WHERE messages_fts MATCH ? AND m.chat_id = ? ORDER BY ${order === 'relevance' ? 'bm25(messages_fts)' : byId} LIMIT ?`,
         )
-        .all(match, chatId, who ? limit * 10 : limit) as unknown as MessageRow[];
+        .all(match, chatId, fetch) as unknown as MessageRow[];
     const terms = words.map((w) => `"${w}"*`);
     let rows = filter(run(terms.join(' ')));
     if (!rows.length && terms.length > 1) rows = filter(run(terms.join(' OR ')));
     return rows.slice(0, limit);
+  }
+
+  // ---- watches
+
+  addWatch(w: Omit<WatchRow, 'id'>): number {
+    const r = this.sql
+      .prepare('INSERT INTO watches (chat_id, thread_id, created_by, created_by_name, user_id, user_key, task, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(w.chat_id, n(w.thread_id), n(w.created_by), n(w.created_by_name), n(w.user_id), w.user_key, w.task, w.expires_at);
+    return Number(r.lastInsertRowid);
+  }
+
+  listWatches(chatId: number): WatchRow[] {
+    return this.sql
+      .prepare('SELECT * FROM watches WHERE chat_id = ? AND done = 0 AND expires_at > unixepoch() ORDER BY id')
+      .all(chatId) as unknown as WatchRow[];
+  }
+
+  /** Open watches in the chat that wait for this sender; marks them done. */
+  takeWatches(chatId: number, sender: { id: number | null; username: string | null; name: string | null }): WatchRow[] {
+    const keys = [sender.username?.toLowerCase(), sender.name?.toLowerCase()].filter(Boolean);
+    const hits = this.listWatches(chatId).filter((w) =>
+      (w.user_id !== null && w.user_id === sender.id) || (w.user_id === null && keys.includes(w.user_key)));
+    for (const w of hits) this.sql.prepare('UPDATE watches SET done = 1 WHERE id = ?').run(w.id);
+    return hits;
+  }
+
+  cancelWatch(chatId: number, id: number): boolean {
+    return this.sql.prepare('UPDATE watches SET done = 1 WHERE id = ? AND chat_id = ? AND done = 0').run(id, chatId).changes > 0;
+  }
+
+  /** The most recent sender in this chat matching a @username or (part of) a display name. */
+  findMember(chatId: number, who: string): { user_id: number | null; user_name: string | null; username: string | null } | undefined {
+    const key = who.replace(/^@/, '').toLowerCase();
+    return this.sql
+      .prepare(
+        `SELECT user_id, user_name, username FROM messages
+         WHERE chat_id = ? AND is_self = 0 AND (lower(username) = ? OR instr(lower(user_name), ?) > 0)
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(chatId, key, key) as { user_id: number | null; user_name: string | null; username: string | null } | undefined;
   }
 
   /** Has this user written in any approved chat? Used to allow DMs from group members. */
@@ -374,4 +484,8 @@ export class DB {
       .prepare('SELECT kind, SUM(cost) AS cost, COUNT(*) AS calls FROM usage WHERE ts >= ? GROUP BY kind ORDER BY cost DESC')
       .all(sinceUnix) as unknown as { kind: string; cost: number; calls: number }[];
   }
+}
+
+function sortBy(order: 'relevance' | 'oldest' | 'newest') {
+  return (a: MessageRow, b: MessageRow) => (order === 'oldest' ? a.id - b.id : b.id - a.id);
 }

@@ -21,8 +21,12 @@ Robert: Done: reminder set for Thu 09:00.
   and reads PDFs and text files. When the current model can't see images, a vision model
   describes them instead.
 - **Researches.** It can search the web, read linked pages, and search older chat history.
-- **Acts.** It sets reminders (one-off, daily, weekly), generates and edits images, and replies
-  with voice messages.
+- **Acts.** It sets reminders (one-off, daily, weekly), takes on tasks for later ("when Igor shows
+  up, suggest the change to him"), generates and edits images, and replies with voice messages.
+- **Checks its work.** For arithmetic, counting and puzzles it runs JavaScript in an isolated
+  sandbox instead of guessing (see [Privacy and security](#privacy-and-security)).
+- **Follows the thread.** It sees edits, and each reply carries a quote of the message it answers,
+  even one sent before Robert joined.
 - **Remembers.** Every message is stored in a local SQLite database. Older conversation is folded
   into a rolling summary, so context stays small and cheap.
 - **Any model, switchable from Telegram.** Use `/model opus`, tap a preset, or say "Robert, switch
@@ -83,6 +87,7 @@ availability, credit).
 |---|---|
 | Mention it | `@my_robert_bot what's the weather in Porto?` |
 | Reply to one of its messages | *(reply)* `and tomorrow?` |
+| Edit a recent message to add its name | `what time is the train` → `Robert, what time is the train?` |
 | Use its name | `Robert, translate this to Spanish` |
 | Voice message that says its name | 🎤 "Robert, add milk to the list…" |
 | Implicit request (*smart* mode) | `can the bot find a pharmacy open now?` |
@@ -100,6 +105,7 @@ Commands:
 | `/models` | everyone | Well-known current models (the newest of each major family), with prices |
 | `/models <words>` | everyone | Search all OpenRouter models, e.g. `/models grok` |
 | `/mode smart\|direct` | owner | *smart* also answers implicit requests; *direct* only answers when addressed |
+| `/names <list>` | owner | Names and nicknames Robert answers to, e.g. `/names Robert, Rob, Роберт*, Роб` |
 | `/status` | everyone | Model, mode, today's spending, memory size |
 | `/summary` | everyone | What Robert remembers from earlier |
 | `/budget <usd>` | owner | Daily spending limit (0 = unlimited) |
@@ -178,7 +184,8 @@ Environment variables take precedence over `.env`, so you can also run Robert wi
   "maxAttachments": 4,                // recent images/PDFs attached as real media
   "maxAsksPerUserPerHour": 40,        // the owner is exempt
   "retentionDays": 0,                 // delete older messages and media; 0 = keep forever
-  "allowDms": "owner"                 // or "members"
+  "allowDms": "owner",                // or "members"
+  "runCode": true                     // false removes the run_js sandbox tool
 }
 ```
 
@@ -225,6 +232,11 @@ Run only one instance per bot token. Telegram delivers each update to a single p
   not left to the model.
 - Robert can't run commands, write files, or reach your local network. Web fetching runs on
   OpenRouter's side.
+- The `run_js` tool runs model-written JavaScript in [QuickJS](https://github.com/justjake/quickjs-emscripten)
+  compiled to WebAssembly, on a separate worker thread with an empty environment. The guest has no
+  `require`/`import`, `process`, files, network, environment variables or timers, only a `console`
+  that returns text. It stops after 5 seconds or 64 MB, and the worker is killed if it doesn't.
+  Set `"runCode": false` to remove the tool.
 - Tokens are redacted from logs, and the data directory is created with owner-only permissions.
 - The automatic bot creation uses your account only during setup, then logs out the session.
   You can confirm in Telegram → Settings → Devices.
@@ -232,7 +244,8 @@ Run only one instance per bot token. Telegram delivers each update to a single p
 ## Limitations
 
 - Bots can't download files larger than 20 MB (a Telegram Bot API limit).
-- Robert can't see messages sent before it joined a group.
+- Robert can't see messages sent before it joined a group, except the text quoted in replies.
+- Telegram doesn't tell bots about deleted messages, so Robert keeps them.
 - If you change privacy mode while the bot is already in a group, remove the bot and add it back.
   Telegram only applies the change on join.
 - In forum supergroups, all topics share one memory. Replies go to the right topic.
@@ -251,7 +264,8 @@ npm run typecheck
 | `src/bot.ts` | Telegram side: ingesting messages and media, triggers, commands, approval, sending |
 | `src/brain.ts` | The LLM side: answer loop with tools, judge, rolling summary, vision fallback |
 | `src/context.ts` | Turns stored messages into the model's context, within a token budget |
-| `src/tools.ts` | Tools the model can call (history search, reminders, images, voice, models) |
+| `src/tools.ts` | Tools the model can call (history search, reminders, waiting tasks, code, images, voice, models) |
+| `src/sandbox/` | The isolated JavaScript sandbox behind `run_js` |
 | `src/openrouter.ts` | Minimal OpenRouter client: chat, transcription, speech, images, models |
 | `src/db.ts` | SQLite schema and queries (`node:sqlite`, full-text search with FTS5) |
 | `src/setup/` | Setup wizard and @BotFather automation (GramJS) |

@@ -4,12 +4,18 @@ import { body, buildContext, displayName, estimateTokens, header, isImage, isPdf
 import type { ChatRow, DB, MessageRow, NewMessage } from './db.ts';
 import { log } from './log.ts';
 import { dataUrl } from './media.ts';
-import type { Catalog } from './models.ts';
+import { historyBudget, shortName, type Catalog } from './models.ts';
 import { OpenRouterError, type ChatMessage, type ChatRequest, type ContentPart, type OpenRouter } from './openrouter.ts';
-import { runTool, toolDefinitions, TOOLS_HELP, type Outbox } from './tools.ts';
+import { runTool, toolDefinitions, toolsHelp, type Outbox } from './tools.ts';
 
 const MAX_STEPS = 8;
 export const NOREPLY = 'NOREPLY';
+
+/** Why Robert is answering: addressed directly, picked by the judge, or a waiting task came due. */
+export type Reason = 'direct' | 'judge' | { task: string; by: string | null };
+
+/** The model produced neither an answer nor NOREPLY. */
+export class EmptyAnswerError extends Error {}
 
 export interface BrainDeps {
   db: DB;
@@ -29,6 +35,8 @@ export class Brain {
   readonly config: Config;
   readonly mediaDir: string;
   readonly persistConfig: () => void;
+  /** Per chat, the model that actually served the last answer (differs from the chosen one for routers). */
+  private readonly served = new Map<number, string>();
 
   constructor(deps: BrainDeps) {
     this.db = deps.db;
@@ -69,7 +77,7 @@ export class Brain {
   // ---- answering
 
   /** Runs the model with tools. Returns the text to send, or null when there is nothing to say. */
-  async respond(chat: ChatRow, trigger: MessageRow, reason: 'direct' | 'judge', outbox: Outbox): Promise<string | null> {
+  async respond(chat: ChatRow, trigger: MessageRow, reason: Reason, outbox: Outbox): Promise<string | null> {
     await this.catalog.ensure();
     const model = this.modelFor(chat);
     try {
@@ -84,37 +92,73 @@ export class Brain {
     }
   }
 
+  /** Facts about Robert itself, so the model doesn't invent them. */
+  private about(chat: ChatRow, model: string, historyTokens: number): string {
+    const m = this.catalog.get(model);
+    const k = (t: number) => `${Math.round(t / 1000)}k`;
+    const facts = [
+      `- You are open-source software (Robert) running on the owner's server. Your answers come from the model ${model}` +
+        `${m ? ` (${shortName(m)}${m.context_length ? `, context window ${k(m.context_length)} tokens` : ''})` : ''} through OpenRouter.`,
+    ];
+    if (model.startsWith('openrouter/') || model.startsWith('~')) {
+      const served = this.served.get(chat.id);
+      facts.push(`- That id is a router: each request may be served by a different model${served ? `; the last answer here came from ${served}` : ''}.`);
+    }
+    facts.push(
+      `- You see the last ~${k(historyTokens)} tokens of this chat word for word, plus a summary of older messages. ` +
+        'search_history reaches every stored message. Changing models doesn\'t lose any of this.',
+      `- Spending: $${this.db.spentToday().toFixed(2)} today${this.config.dailyBudgetUsd ? ` of a $${this.config.dailyBudgetUsd} daily budget` : ' (no daily budget)'}. ` +
+        `Each person except the owner can ask you up to ${this.config.maxAsksPerUserPerHour} times an hour.`,
+      '- You can\'t see messages sent before you joined, deleted messages, or files over 20 MB.',
+    );
+    return facts.join('\n');
+  }
+
   private async respondWith(
-    chat: ChatRow, trigger: MessageRow, reason: 'direct' | 'judge', outbox: Outbox, model: string, media: boolean,
+    chat: ChatRow, trigger: MessageRow, reason: Reason, outbox: Outbox, model: string, media: boolean,
   ): Promise<string | null> {
     const useTools = this.catalog.supports(model, 'tools');
+    const historyTokens = historyBudget(this.catalog.get(model), this.config.historyTokens);
     const system = renderSystem(loadTemplate(), {
       config: this.config,
       chat,
       model,
       ownerName: this.ownerName(),
-      tools: useTools ? TOOLS_HELP : 'None: this model does not support tools. Say so if asked to search, remind or create media.',
+      tools: useTools ? toolsHelp(this.config) : 'None: this model does not support tools. Say so if asked to search, remind or create media.',
+      about: this.about(chat, model, historyTokens),
     });
     const ctx = await buildContext({
-      db: this.db, config: this.config, chat, model, trigger, reason, system,
+      db: this.db, config: this.config, chat, model, trigger, reason, system, historyTokens,
       canSee: media && this.catalog.supports(model, 'image'),
       canReadFiles: media,
       describe: (m) => this.describe(m, chat.id),
     });
-    const req: ChatRequest = { model, messages: ctx.messages, max_tokens: 4096 };
+    // Generous, because reasoning models spend part of it thinking.
+    const req: ChatRequest = { model, messages: ctx.messages, max_tokens: 8192 };
     if (useTools) {
-      req.tools = toolDefinitions();
+      req.tools = toolDefinitions(this.config);
       req.max_tool_calls = 10;
     }
     if (ctx.hasFiles) {
       req.plugins = [{ id: 'file-parser', pdf: { engine: this.catalog.supports(model, 'file') ? 'native' : 'cloudflare-ai' } }];
     }
 
+    let retried = false;
     for (let step = 0; step < MAX_STEPS; step++) {
       const res = await this.or.chat(req, { kind: 'chat', chatId: chat.id });
-      const msg = res.choices[0].message;
+      if (res.model) this.served.set(chat.id, res.model);
+      const choice = res.choices[0];
+      const msg = choice.message;
       const calls = (msg.tool_calls ?? []).filter((c) => c.type === 'function');
-      if (!calls.length) return finalText(msg);
+      if (!calls.length) {
+        if (!isEmpty(msg)) return finalText(msg);
+        // Some models occasionally return nothing (e.g. all tokens went to reasoning). Ask once more.
+        log.warn(`chat ${chat.id}: ${model} returned an empty answer (finish_reason ${choice.finish_reason ?? '?'})`);
+        if (retried) throw new EmptyAnswerError(`${model} returned an empty answer`);
+        retried = true;
+        req.messages.push({ role: 'user', content: '(Your reply was empty. Write your answer now, or NOREPLY.)' });
+        continue;
+      }
       req.messages.push({
         role: 'assistant',
         content: msg.content ?? null,
@@ -128,6 +172,7 @@ export class Brain {
     }
     req.messages.push({ role: 'user', content: 'Tool budget exhausted. Give your final answer now, without tools.' });
     const res = await this.or.chat({ ...req, tool_choice: 'none' }, { kind: 'chat', chatId: chat.id });
+    if (isEmpty(res.choices[0].message)) throw new EmptyAnswerError(`${model} returned an empty answer`);
     return finalText(res.choices[0].message);
   }
 
@@ -185,7 +230,7 @@ export class Brain {
     const recent = this.db.recent(chat.id, 0, 16).filter((m) => m.id <= newest.id || m.is_self).reverse();
     const tz = this.config.timezone;
     const transcript = recent
-      .map((m) => (m.is_self ? `[#${m.tg_id} ASSISTANT]\n` : `${header(m, tz)}\n`) + body(m).slice(0, 600))
+      .map((m) => (m.is_self ? `[#${m.tg_id} ASSISTANT]\n` : `${header(m, tz, undefined, this.db, 'ASSISTANT')}\n`) + body(m).slice(0, 600))
       .join('\n\n');
     const [name, ...aliases] = this.config.names;
     const ids = candidates.map((c) => c.tg_id);
@@ -246,7 +291,7 @@ export class Brain {
       let last = fold[i];
       while (i < fold.length && estimateTokens(chunk) < 30_000) {
         const m = fold[i++];
-        chunk += `${m.is_self ? `[#${m.tg_id} ${this.config.names[0]} (assistant)]` : header(m, tz)}\n${body(m).slice(0, 4000)}\n\n`;
+        chunk += `${m.is_self ? `[#${m.tg_id} ${this.config.names[0]} (assistant)]` : header(m, tz, undefined, this.db, 'the assistant')}\n${body(m).slice(0, 4000)}\n\n`;
         last = m;
       }
       const res = await this.or.chat(
@@ -261,7 +306,7 @@ export class Brain {
                 'summary with the new messages into an updated summary of at most 500 words, in the main language of ' +
                 'the chat. Keep: who is who, facts people shared about themselves, decisions, plans and dates, open ' +
                 'questions, preferences, and what the assistant was asked and answered. Drop small talk. ' +
-                'Refer to messages by #id when useful. Output only the summary.',
+                'Refer to messages by who wrote them and when, not by #id (people can\'t see ids). Output only the summary.',
             },
             { role: 'user', content: `Previous summary:\n${summary || '(none)'}\n\nNew messages:\n${chunk}` },
           ],
@@ -276,9 +321,27 @@ export class Brain {
   }
 }
 
-export function finalText(msg: ChatMessage): string | null {
+function rawText(msg: ChatMessage): string {
   const c = msg.content;
-  const text = (typeof c === 'string' ? c : Array.isArray(c) ? c.map((p) => (p.type === 'text' ? p.text : '')).join('') : '').trim();
+  return (typeof c === 'string' ? c : Array.isArray(c) ? c.map((p) => (p.type === 'text' ? p.text : '')).join('') : '').trim();
+}
+
+const isEmpty = (msg: ChatMessage) => !rawText(msg);
+
+export function finalText(msg: ChatMessage): string | null {
+  const text = rawText(msg);
   if (!text || text === NOREPLY || /^NOREPLY\W*$/.test(text)) return null;
-  return text;
+  return unglue(text);
+}
+
+/**
+ * Text around server-side tool calls (web search) arrives joined without a break, e.g.
+ * "Let me check.Igor, here's…". Puts a paragraph break where a sentence ends and the next starts
+ * with no space, outside code.
+ */
+export function unglue(text: string): string {
+  return text
+    .split(/(```[\s\S]*?```|`[^`\n]*`)/)
+    .map((part, i) => (i % 2 ? part : part.replace(/(\p{Ll}{2}[.!?…])(?=\p{Lu}\p{Ll})/gu, '$1\n\n')))
+    .join('');
 }
