@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "A Telegram group assistant that listens to everything, speaks when asked, and runs any OpenRouter model.",
   "license": "MIT",
+  "contributors": [
+    "Nikolay Sergeichev <llx@llx.ru>"
+  ],
   "type": "module",
   "private": true,
   "bin": {
